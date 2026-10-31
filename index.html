@@ -7,6 +7,12 @@
 <meta name="description" content="언제든 들어와 앉아 기도하는 온라인 예배당. 함께 이어 쓰는 성경 릴레이, 새벽기도·수요예배·주일예배.">
 <meta property="og:title" content="말씀정원 · 온라인 예배당">
 <meta property="og:description" content="교회 갈 힘 없는 날, 잠깐 앉았다 가세요 🕊️">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://malm-giwon.vercel.app/">
+<meta property="og:image" content="https://malm-giwon.vercel.app/og.png">
+<meta property="og:image:width" content="1200"><meta property="og:image:height" content="630">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://malm-giwon.vercel.app/og.png">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Crect width=%2264%22 height=%2264%22 rx=%2214%22 fill=%22%231b1e1d%22/%3E%3Cpath d=%22M32 8v10M27 12h10M14 32 32 18l18 14M19 29v23h26V29M28 52v-8a4 4 0 0 1 8 0v8%22 fill=%22none%22 stroke=%22%23e9dcc2%22 stroke-width=%223%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E">
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
@@ -98,9 +104,9 @@ canvas{display:block;width:100%;height:100%;touch-action:none}
 .hint{position:absolute;left:50%;bottom:150px;transform:translateX(-50%);font-size:12px;color:#d9d0c0;background:#1d1830a8;padding:5px 11px;border-radius:99px;white-space:nowrap;pointer-events:none;transition:opacity .6s}
 .mode{margin-top:6px;font-size:11px;color:#f3e6c4;display:none;width:max-content;background:#1d1830b8;padding:3px 9px;border-radius:9px}
 /* sheet */
-.veil{position:absolute;inset:0;background:#0d0a1880;opacity:0;pointer-events:none;transition:opacity .25s}
+.veil{position:absolute;inset:0;z-index:60;background:#0d0a1880;opacity:0;pointer-events:none;transition:opacity .25s}
 .veil.show{opacity:1;pointer-events:auto}
-.sheet{position:absolute;left:0;right:0;bottom:0;background:var(--cream);color:var(--ink);border-radius:22px 22px 0 0;padding:16px 18px calc(18px + env(safe-area-inset-bottom));transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1);max-height:88%;overflow:auto}
+.sheet{position:absolute;z-index:61;left:0;right:0;bottom:0;background:var(--cream);color:var(--ink);border-radius:22px 22px 0 0;padding:16px 18px calc(18px + env(safe-area-inset-bottom));transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1);max-height:88%;overflow:auto}
 .sheet.show{transform:none}
 .grab{width:40px;height:4px;border-radius:4px;background:#d6ccb8;margin:0 auto 12px}
 .sheet h2{margin:0 0 2px;font-family:"Gowun Batang",serif;font-size:19px}
@@ -121,7 +127,7 @@ textarea.bad{border-color:var(--rose)}
 .btn.ghost{background:transparent;box-shadow:none;color:var(--ink2);padding:13px 10px}
 .done{text-align:center;padding:14px 4px}
 .done .big{font-size:44px}
-.toast{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%) scale(.9);background:#fbf6ecf2;color:var(--ink);padding:14px 18px;border-radius:16px;font-family:"Gowun Batang",serif;font-size:15px;text-align:center;opacity:0;pointer-events:none;transition:all .35s;box-shadow:0 10px 40px #0006;max-width:84%}
+.toast{position:absolute;z-index:62;left:50%;top:46%;transform:translate(-50%,-50%) scale(.9);background:#fbf6ecf2;color:var(--ink);padding:14px 18px;border-radius:16px;font-family:"Gowun Batang",serif;font-size:15px;text-align:center;opacity:0;pointer-events:none;transition:all .35s;box-shadow:0 10px 40px #0006;max-width:84%}
 .toast.show{opacity:1;transform:translate(-50%,-50%) scale(1)}
 .namebox{margin-top:12px;display:flex;gap:8px}
 .namebox input{flex:1;border:2px solid #e3d8c3;border-radius:12px;padding:10px;font:inherit;font-size:15px;outline:none}
@@ -215,7 +221,7 @@ textarea.bad{border-color:var(--rose)}
     <h2>말씀정원</h2>
     <div class="ss" id="splashSub">예배당 문을 여는 중</div>
     <div class="sd"></div>
-    <div class="sv">개역한글 성경 · 찬송은 저작권이 만료된 곡의 연주입니다</div>
+    <div class="sv">개역한글 성경 · 찬송은 저작권이 만료된 곡의 연주입니다<br><a id="splashInfo" style="color:#7d776d;text-decoration:underline">이용 안내 · 개인정보 처리방침</a></div>
   </div>
   <div class="sheet" id="sheet"><div class="grab"></div><div id="sheetBody"></div></div>
   <div class="toast" id="toast"></div>
@@ -690,11 +696,12 @@ function openMenu(){
      <button class="mi" id="mNew"><span>⛪</span><div><b>우리 교회·모임 방 만들기</b><small>구역, 청년부, 주일학교끼리 따로 릴레이</small></div></button>
      <button class="mi" id="mJoin"><span>🔑</span><div><b>방 코드로 입장</b><small>전달받은 코드 입력</small></div></button>
      ${group?`<button class="mi" id="mShare"><span>📨</span><div><b>방 코드 복사하기</b><small>${esc(group.code)}</small></div></button><button class="mi" id="mPlaza"><span>🌿</span><div><b>모두의 광장으로 돌아가기</b><small>전체 릴레이</small></div></button>`:""}
+     <button class="mi" id="mInfo"><span>📄</span><div><b>이용 안내 · 개인정보 처리방침</b><small>말씀정원을 이용하기 전에 읽어 주세요</small></div></button>
      <button class="mi" id="mName"><span>🐑</span><div><b>내 이름·색 바꾸기</b><small>${esc(me.n)}</small></div></button>
    </div>`);
   $("mCard").onclick=()=>{ const l=mineList(); const m=l[l.length-1]; if(m) openCard(m.camp,m.v,me.n); else openDaily(); };
   $("mCert").onclick=()=>{ if(doneCamps.length) openCertPicker(doneCamps); else certPreview(); };
-  $("mSpace").onclick=openSpaces; $("mNew").onclick=openNewGroup; $("mJoin").onclick=openJoin; $("mName").onclick=openName;
+  $("mInfo").onclick=openInfo; $("mSpace").onclick=openSpaces; $("mNew").onclick=openNewGroup; $("mJoin").onclick=openJoin; $("mName").onclick=openName;
   if(group){ $("mShare").onclick=()=>copyText(group.code,"방 코드를 복사했어요"); $("mPlaza").onclick=()=>{closeSheet();switchGroup(null);}; }
 }
 function copyText(t,msg){ try{ navigator.clipboard.writeText(t).then(()=>toast(msg),()=>toast("복사가 막혔어요. 코드: "+esc(t))); }catch(e){ toast("코드: "+esc(t)); } }
@@ -981,6 +988,26 @@ function curStep(sp){
   return {st,ord,i:ord.length-1,step:ord[ord.length-1],left:0,prog:1};
 }
 
+// ---------- 이용 안내 ----------
+const CONTACT = ""; // 운영자 문의 이메일을 넣으면 안내 페이지에 표시돼요
+function openInfo(){
+  openSheet(`<h2>이용 안내</h2>
+  <div class="list" style="font-size:13.5px;line-height:1.75;color:#3b3450">
+  <p><b>말씀정원</b>은 누구나 로그인 없이 들어와 기도하고, 성경을 한 절씩 함께 이어 쓰는 온라인 예배 공간이에요. 특정 교회나 교단과 관계없이 운영돼요.</p>
+  <p>• 다른 사람을 비방하거나 광고·홍보, 불쾌한 내용을 올리지 말아 주세요. 이런 글은 예고 없이 삭제될 수 있어요.<br>
+  • 기도제목에는 <b>실명, 연락처, 주소, 다른 사람의 개인적인 사정</b>을 적지 말아 주세요.<br>
+  • 성경 본문은 저작권이 만료된 <b>개역한글</b>을 사용해요. 찬송은 저작권이 만료된 곡의 멜로디를 연주한 거예요.<br>
+  • 예배 순서는 함께 말씀을 읽고 기도하도록 돕는 안내이며, 교회 예배를 대신하지 않아요.</p>
+  <h2 style="margin-top:18px">개인정보 처리방침</h2>
+  <p><b>1. 수집하는 정보</b><br>회원가입이나 로그인은 없어요. 이용 중 여러분이 직접 입력한 <b>닉네임, 이어 쓴 구절, 기도제목, 작성 시각</b>과, 같은 공간에 있는 사람을 보여 주기 위한 <b>임시 접속 정보(화면 속 위치·상태)</b>만 처리해요. 이름, 전화번호, 이메일 같은 정보는 받지 않아요.</p>
+  <p><b>2. 이용 목적</b><br>성경 릴레이 진행 상황과 기도제목을 다른 이용자와 함께 보여 주고, 같은 공간에 함께 있는 사람을 표시하기 위해서만 사용해요. 광고나 판매 목적으로 쓰지 않아요.</p>
+  <p><b>3. 보관 장소와 기간</b><br>입력한 내용은 데이터 저장 서비스(Supabase, 해외 클라우드)에 저장되고, 작성자가 내리거나 운영자가 삭제할 때까지 보관돼요. 접속 상태 정보는 페이지를 닫으면 사라져요. 닉네임·화면 설정 등 일부 정보는 여러분의 기기(브라우저)에만 저장돼요.</p>
+  <p><b>4. 삭제 방법</b><br>내가 올린 기도제목은 기도제목 목록의 <b>'내 기도제목 내리기'</b>로 언제든 지울 수 있어요(올린 기기에서만 가능).${CONTACT?` 그 밖의 삭제 요청은 ${esc(CONTACT)}로 보내 주세요.`:""}</p>
+  <p><b>5. 제3자 제공</b><br>입력한 정보를 다른 회사나 단체에 제공하지 않아요.</p>
+  <p style="color:#9a8f86;font-size:12px">시행일: 2026년 11월 1일</p>
+  </div><div class="row"><button class="btn go" id="infoOk" style="flex:1">확인</button></div>`);
+  $("infoOk").onclick=closeSheet;
+}
 // ---------- 공간 이동 ----------
 function openSpaces(){
   const rows=Object.entries(SPACES).map(([k,S])=>{
@@ -1170,7 +1197,7 @@ $("clMove").onclick=openSpaces;
 const splashStart=Date.now();
 function splashReady(){ const sp=$("splash"); if(!sp||sp.classList.contains("ready")) return; sp.classList.add("ready");
   $("splashSub").innerHTML="화면을 눌러 들어가기<br><span style='font-size:12.5px;color:#6f6a62'>🎵 찬송이 함께 흘러나와요</span>";
-  sp.onclick=()=>{ sp.classList.add("out"); if(ls("br_audio")!==false) setAudio(true); setTimeout(()=>sp.remove(),1100); const h=$("hint"); h.style.opacity=1; setTimeout(()=>h.style.opacity=0,7000); }; }
+  sp.onclick=(e)=>{ if(e.target&&e.target.id==="splashInfo"){ e.stopPropagation(); openInfo(); return; } sp.classList.add("out"); if(ls("br_audio")!==false) setAudio(true); setTimeout(()=>sp.remove(),1100); const h=$("hint"); h.style.opacity=1; setTimeout(()=>h.style.opacity=0,7000); }; }
 setTimeout(splashReady, 2600);
 if(!build3D()){ $("hint").textContent="3D 화면을 불러오지 못했어요. 새로고침해 주세요"; $("hint").style.opacity=1; }
 window.addEventListener("resize",resize); resize();
