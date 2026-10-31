@@ -1,0 +1,1187 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>말씀정원 · 온라인 예배당</title>
+<meta name="description" content="언제든 들어와 앉아 기도하는 온라인 예배당. 함께 이어 쓰는 성경 릴레이, 새벽기도·수요예배·주일예배.">
+<meta property="og:title" content="말씀정원 · 온라인 예배당">
+<meta property="og:description" content="교회 갈 힘 없는 날, 잠깐 앉았다 가세요 🕊️">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 64 64%22%3E%3Crect width=%2264%22 height=%2264%22 rx=%2214%22 fill=%22%231b1e1d%22/%3E%3Cpath d=%22M32 8v10M27 12h10M14 32 32 18l18 14M19 29v23h26V29M28 52v-8a4 4 0 0 1 8 0v8%22 fill=%22none%22 stroke=%22%23e9dcc2%22 stroke-width=%223%22 stroke-linecap=%22round%22 stroke-linejoin=%22round%22/%3E%3C/svg%3E">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+<script>
+// ===== 말씀정원 독립 사이트 설정 =====
+// Supabase → Project Settings → API (또는 Connect) 에서 복사해 넣으세요
+const SUPABASE_URL = "https://wanbimaryunarvkuqkdh.supabase.co";
+const SUPABASE_KEY = "sb_publishable_VhH6KBAZ2lLQ30zZbxdEzA_sHoOMWHs"; // anon / publishable 키 (공개돼도 되는 키). service_role 키는 절대 넣지 마세요
+// ===================================
+(function(){
+  if(!window.supabase || !/^https:\/\/.+supabase\.co/.test(SUPABASE_URL) || SUPABASE_KEY.length<20) return;
+  const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {auth:{persistSession:false}});
+  const store=(k,v)=>{try{if(v===undefined)return localStorage.getItem(k);localStorage.setItem(k,v);}catch(e){return null}};
+  let clientId=store("sb_client"); if(!clientId){ clientId=Math.random().toString(36).slice(2,10)+Date.now().toString(36); store("sb_client",clientId); }
+  let ownerToken=store("sb_owner"); if(!ownerToken){ ownerToken=[...crypto.getRandomValues(new Uint8Array(16))].map(b=>b.toString(16).padStart(2,"0")).join(""); store("sb_owner",ownerToken); }
+  async function sha256hex(s){ const b=await crypto.subtle.digest("SHA-256",new TextEncoder().encode(s)); return [...new Uint8Array(b)].map(x=>x.toString(16).padStart(2,"0")).join(""); }
+  function parse(path){ const p=path.split("/"); if(p[0]==="groups"&&p.length===3) return {table:p[2],scope:p[1]}; if(p[0]==="groups"&&p.length===1) return {table:"groups"}; return {table:p[0],scope:"plaza"}; }
+  const COLS={verses:["n","c","at","camp","v"],prayers:["n","c","t","at","amen"],groups:["name","at","by"]};
+  const pick=(t,row)=>{ const o={}; for(const k of COLS[t]) if(row&&row[k]!==undefined) o[k]=row[k]; return o; };
+  function keyQ(q,info,id){ if(info.table==="groups") return q.eq("code",id); q=q.eq("id",id); return info.scope&&info.table!=="prayers"?q.eq("scope",info.scope):q; }
+  const db={ collection(path){ const info=parse(path); return {
+    doc(id){ return {
+      async get(){ const {data,error}=await keyQ(sb.from(info.table).select("*"),info,id).maybeSingle(); if(error) throw error; return {exists:!!data, data:()=>data?pick(info.table,data):null}; },
+      async set(rec){ let row; if(info.table==="groups") row={code:id,...pick("groups",rec)}; else row={id,scope:info.scope,...pick(info.table,rec)};
+        if(info.table==="prayers"){ row.amen=0; row.owner_hash=await sha256hex(ownerToken); }
+        const {error}=await sb.from(info.table).insert(row); if(error) throw error; },
+      async update(){ if(info.table!=="prayers") throw new Error("no update"); const {error}=await sb.rpc("pray_amen",{pid:id}); if(error) throw error; },
+      async delete(){ if(info.table!=="prayers") throw new Error("no delete"); const {data,error}=await sb.rpc("delete_prayer",{pid:id,token:ownerToken}); if(error) throw error; if(!data) throw new Error("not owner"); }
+    }; },
+    onSnapshot(cb){
+      let alive=true, timer=null;
+      const load=async()=>{ let q=sb.from(info.table).select("*");
+        if(info.table==="prayers") q=q.eq("scope",info.scope).order("at",{ascending:false}).limit(300); else q=q.eq("scope",info.scope).limit(2000);
+        const {data,error}=await q; if(!alive||error) return; cb({docs:(data||[]).map(r=>({id:r.id,data:()=>pick(info.table,r)}))}); };
+      load();
+      const ch=sb.channel("db-"+info.table+"-"+info.scope+"-"+Math.random().toString(36).slice(2,6))
+        .on("postgres_changes",{event:"*",schema:"public",table:info.table,filter:"scope=eq."+info.scope},()=>{ clearTimeout(timer); timer=setTimeout(load,250); })
+        .subscribe();
+      const poll=setInterval(load,30000);
+      return ()=>{ alive=false; clearInterval(poll); sb.removeChannel(ch); };
+    } }; } };
+  function makeRoom(name){
+    let ch=null, ready=false, pending=null, peersFn=null;
+    const emit=()=>{ if(!peersFn||!ch) return; const st=ch.presenceState(); peersFn(Object.entries(st).map(([k,arr])=>({id:k,you:k===clientId,presence:arr[arr.length-1]}))); };
+    ch=sb.channel("room:"+name,{config:{presence:{key:clientId}}});
+    ch.on("presence",{event:"sync"},emit).on("presence",{event:"join"},emit).on("presence",{event:"leave"},emit)
+      .subscribe(s=>{ if(s==="SUBSCRIBED"){ ready=true; if(pending) ch.track(pending); } });
+    return {
+      presence(state){ pending=state; if(ready) ch.track(state); },
+      onPeers(fn){ peersFn=fn; emit(); },
+      async join(n){ return makeRoom(n); },
+      leave(){ try{ ch.untrack(); }catch(e){} sb.removeChannel(ch); ch=null; }
+    };
+  }
+  let lobby=null;
+  window.claude={ use: async(n)=> n==="db"?db : n==="room"?(lobby||(lobby=makeRoom("lobby"))) : null };
+})();
+</script>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Gowun+Batang:wght@400;700&family=Gowun+Dodum&display=swap" rel="stylesheet">
+<style>
+:root{
+  --ink:#2b2340; --ink2:#5b5270; --cream:#fbf6ec; --gold:#e8b65a; --gold2:#f6d892;
+  --night:#1d1830; --rose:#e98a8a; --sage:#8fb996;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--night);color:var(--cream);font-family:"Gowun Dodum",system-ui,sans-serif;overflow:hidden;overscroll-behavior:none}
+#app{position:relative;height:100%;max-width:560px;margin:0 auto;overflow:hidden;background:#241d38}
+canvas{display:block;width:100%;height:100%;touch-action:none}
+.top{position:absolute;left:0;right:0;top:0;padding:12px 14px 10px;background:linear-gradient(#1d1830f2,#1d183000);pointer-events:none}
+.brand{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.brand h1{margin:0;font-family:"Gowun Batang",serif;font-size:18px;letter-spacing:.5px;color:var(--gold2)}
+.live{display:flex;align-items:center;gap:6px;font-size:12px;background:#ffffff14;border:1px solid #ffffff22;padding:4px 9px;border-radius:99px;white-space:nowrap}
+.dot{width:7px;height:7px;border-radius:50%;background:#7ee0a0;box-shadow:0 0 8px #7ee0a0}
+.dot.off{background:#c9b88f;box-shadow:none}
+.camp{margin-top:9px;font-size:12.5px;color:#e9e2d4}
+.camp b{font-family:"Gowun Batang",serif;color:#fff;font-size:14px}
+.bar{height:6px;background:#ffffff1c;border-radius:9px;margin-top:6px;overflow:hidden}
+.bar i{display:block;height:100%;width:0;background:linear-gradient(90deg,var(--gold),var(--gold2));border-radius:9px;transition:width .6s}
+.feed{position:absolute;left:12px;bottom:84px;display:flex;flex-direction:column;gap:5px;pointer-events:none;max-width:70%}
+.feed div{font-size:11.5px;background:#1d1830b8;border:1px solid #ffffff18;padding:4px 9px;border-radius:10px;animation:fin .4s ease-out;color:#efe7d6}
+@keyframes fin{from{opacity:0;transform:translateY(-6px)}}
+.hud{position:absolute;left:0;right:0;bottom:0;padding:10px 12px calc(12px + env(safe-area-inset-bottom));display:flex;gap:8px;align-items:center;background:linear-gradient(#1d183000,#1d1830f0 40%)}
+.btn{border:0;border-radius:16px;font:inherit;cursor:pointer;color:var(--ink);background:var(--cream);padding:12px 14px;font-size:14px;box-shadow:0 3px 0 #0003;display:flex;align-items:center;gap:6px;justify-content:center}
+.btn:active{transform:translateY(2px);box-shadow:0 1px 0 #0003}
+.btn.main{flex:1;background:linear-gradient(#f6d892,#e8b65a);font-weight:700;font-size:15px}
+.btn.icon{width:42px;padding:12px 0;font-size:18px;background:#ffffff1f;color:#fff;border:1px solid #ffffff2a;box-shadow:none}
+.btn.icon.on{background:#e8b65a55;border-color:var(--gold)}
+.hint{position:absolute;left:50%;bottom:150px;transform:translateX(-50%);font-size:12px;color:#d9d0c0;background:#1d1830a8;padding:5px 11px;border-radius:99px;white-space:nowrap;pointer-events:none;transition:opacity .6s}
+.mode{margin-top:6px;font-size:11px;color:#f3e6c4;display:none;width:max-content;background:#1d1830b8;padding:3px 9px;border-radius:9px}
+/* sheet */
+.veil{position:absolute;inset:0;background:#0d0a1880;opacity:0;pointer-events:none;transition:opacity .25s}
+.veil.show{opacity:1;pointer-events:auto}
+.sheet{position:absolute;left:0;right:0;bottom:0;background:var(--cream);color:var(--ink);border-radius:22px 22px 0 0;padding:16px 18px calc(18px + env(safe-area-inset-bottom));transform:translateY(105%);transition:transform .3s cubic-bezier(.2,.8,.2,1);max-height:88%;overflow:auto}
+.sheet.show{transform:none}
+.grab{width:40px;height:4px;border-radius:4px;background:#d6ccb8;margin:0 auto 12px}
+.sheet h2{margin:0 0 2px;font-family:"Gowun Batang",serif;font-size:19px}
+.sub{font-size:12.5px;color:var(--ink2)}
+.prev{margin-top:12px;padding:10px 12px;border-left:3px solid #d9c9a3;background:#f3ecdd;border-radius:0 10px 10px 0;font-family:"Gowun Batang",serif;font-size:14px;line-height:1.6;color:#6b6178}
+.prev small{display:block;font-family:"Gowun Dodum",sans-serif;font-size:11px;color:#9a8f86;margin-bottom:2px}
+.target{margin-top:12px;font-family:"Gowun Batang",serif;font-size:17px;line-height:1.75;letter-spacing:.2px}
+.target .vn{display:inline-block;background:var(--ink);color:var(--gold2);font-size:12px;padding:1px 8px;border-radius:9px;margin-right:6px;vertical-align:3px;font-family:"Gowun Dodum",sans-serif}
+.target .ok{color:#3f8a5c}
+.target .rest{color:#aaa092}
+textarea{width:100%;margin-top:12px;min-height:92px;border:2px solid #e3d8c3;border-radius:14px;padding:12px;font:17px/1.6 "Gowun Batang",serif;color:var(--ink);background:#fff;resize:none;outline:none}
+textarea:focus{border-color:var(--gold)}
+textarea.bad{border-color:var(--rose)}
+.row{display:flex;gap:8px;margin-top:12px;align-items:center}
+.meter{flex:1;font-size:12px;color:var(--ink2)}
+.btn.go{background:var(--ink);color:var(--gold2);padding:13px 18px;font-weight:700}
+.btn.go:disabled{opacity:.35}
+.btn.ghost{background:transparent;box-shadow:none;color:var(--ink2);padding:13px 10px}
+.done{text-align:center;padding:14px 4px}
+.done .big{font-size:44px}
+.toast{position:absolute;left:50%;top:46%;transform:translate(-50%,-50%) scale(.9);background:#fbf6ecf2;color:var(--ink);padding:14px 18px;border-radius:16px;font-family:"Gowun Batang",serif;font-size:15px;text-align:center;opacity:0;pointer-events:none;transition:all .35s;box-shadow:0 10px 40px #0006;max-width:84%}
+.toast.show{opacity:1;transform:translate(-50%,-50%) scale(1)}
+.namebox{margin-top:12px;display:flex;gap:8px}
+.namebox input{flex:1;border:2px solid #e3d8c3;border-radius:12px;padding:10px;font:inherit;font-size:15px;outline:none}
+.grp{display:none;font-size:11.5px;background:#e8b65a33;border:1px solid #e8b65a88;color:#f6d892;padding:2px 8px;border-radius:99px;margin-right:6px;vertical-align:1px}
+.menu{display:flex;flex-direction:column;gap:8px;margin-top:14px}
+.mi{display:flex;align-items:center;gap:12px;text-align:left;border:1px solid #e6dcc8;background:#fff;border-radius:14px;padding:11px 12px;font:inherit;color:var(--ink);cursor:pointer}
+.mi:active{background:#f6efe0}
+.mi span{font-size:22px;width:30px;text-align:center}
+.mi b{display:block;font-size:14.5px}
+.mi small{display:block;font-size:12px;color:var(--ink2);margin-top:1px}
+.code{font-size:34px;letter-spacing:6px;font-weight:700;margin:14px 0;color:var(--ink);font-family:monospace;background:#f3ecdd;border-radius:12px;padding:10px}
+.cardimg{display:block;width:100%;border-radius:12px;margin-top:12px;box-shadow:0 6px 20px #0002}
+.spn{pointer-events:auto;border:0;background:transparent;color:var(--gold2);font-family:"Gowun Batang",serif;font-size:19px;font-weight:700;padding:0;cursor:pointer;display:flex;align-items:center;gap:4px}
+.spn:after{content:"▾";font-size:13px;opacity:.8;margin-left:2px}
+.spn small{font-size:11px}
+.svc{position:absolute;left:10px;right:10px;top:104px;background:#fbf6ecf2;color:var(--ink);border-radius:16px;box-shadow:0 8px 30px #0005;display:none;overflow:hidden}
+.svh{display:flex;align-items:center;gap:8px;padding:9px 12px;background:#2b2340;color:#f6d892;font-size:13px}
+.svh b{flex:1;font-family:"Gowun Batang",serif;font-size:14.5px}
+.svh span{font-variant-numeric:tabular-nums;font-size:12.5px;color:#efe7d6}
+.svh button{border:0;background:#ffffff1f;color:#fff;border-radius:8px;font:inherit;font-size:11.5px;padding:3px 8px;cursor:pointer}
+.svb{max-height:30vh;overflow:auto;padding:10px 14px 12px;font-size:14px;line-height:1.7}
+.svc.min .svb{display:none}
+.svb p{margin:4px 0;font-family:"Gowun Batang",serif;font-size:15px}
+.svb sup{color:#c98f2a;font-size:10px;margin-right:4px;font-family:"Gowun Dodum",sans-serif}
+.svb .calm{font-family:"Gowun Dodum",sans-serif;font-size:13.5px;color:var(--ink2)}
+.pref{font-size:12px;color:#9a7a3a;margin-bottom:4px}
+.qs{margin:6px 0;padding-left:20px;font-family:"Gowun Batang",serif;font-size:15px}
+.order{margin:8px 0 2px;padding-left:20px;font-size:13px;color:var(--ink2)}
+.order small{color:#a99f8f}
+.nextup{margin-top:8px;font-size:12px;color:#9a8f86;border-top:1px dashed #e0d5c0;padding-top:6px}
+.btn.sm{padding:9px 12px;font-size:13px;margin-top:8px;width:100%}
+.closed{position:absolute;inset:0;display:none;flex-direction:column;align-items:center;justify-content:center;gap:8px;background:#120d22d9;text-align:center;padding:24px}
+.closed h3{margin:0;font-family:"Gowun Batang",serif;font-size:24px;color:#f6d892}
+.closed .w{font-size:15px;color:#fbf6ec}
+.closed .l{font-size:13px;color:#cfc4b0;margin-bottom:10px}
+.closed .btn{width:240px;flex:none}
+.b{display:inline-block;font-style:normal;font-size:11px;margin-top:4px;padding:1px 7px;border-radius:99px;background:#f0e8d8;color:#8a7f72}
+.b.on{background:#e8f3ea;color:#3f8a5c}
+.b.live{background:#fde7ea;color:#c0394f;font-weight:700}
+.mi.cur{border-color:var(--gold);background:#fff8e6}
+.pw{display:flex;flex-direction:column;gap:7px;margin-top:8px}
+.pi{background:#fff;border:1px solid #ece2cf;border-radius:12px;padding:9px 11px}
+.pt{font-size:14px;line-height:1.55;color:var(--ink);white-space:pre-wrap;word-break:break-all}
+.pm{display:flex;align-items:center;justify-content:space-between;gap:6px;margin-top:5px;font-size:11.5px;color:#9a8f86}
+.pm i{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px;vertical-align:0}
+.amen{border:1px solid #e3d8c3;background:#fbf6ec;border-radius:99px;font:inherit;font-size:12px;padding:4px 10px;cursor:pointer;color:var(--ink);white-space:nowrap}
+.amen.on{background:#2b2340;color:#f6d892;border-color:#2b2340}
+.del{border:0;background:none;color:#b0646e;font:inherit;font-size:11.5px;align-self:flex-end;margin-top:-4px;cursor:pointer}
+.tabs{display:flex;gap:6px;margin-top:14px}
+.tabs button{border:1px solid #e3d8c3;background:#fff;border-radius:99px;font:inherit;font-size:12.5px;padding:5px 11px;cursor:pointer;color:var(--ink2)}
+.tabs button.on{background:var(--ink);color:#f6d892;border-color:var(--ink)}
+#splash{position:absolute;inset:0;z-index:50;background:#1b1e1d;display:flex;flex-direction:column;align-items:center;justify-content:center;transition:opacity 1s ease;cursor:pointer}
+#splash.out{opacity:0;pointer-events:none}
+#splash svg{width:66px;height:66px;opacity:0;animation:sfade 1.4s .2s ease forwards}
+#splash h2{margin:30px 0 0;font-family:"Gowun Batang",serif;font-weight:400;font-size:38px;letter-spacing:14px;padding-left:14px;color:#e9dcc2;opacity:0;animation:sfade 1.4s .6s ease forwards}
+#splash .ss{margin-top:26px;font-size:15px;letter-spacing:1px;color:#8d877c;opacity:0;animation:sfade 1.2s 1s ease forwards;min-height:22px;text-align:center;line-height:1.6}
+#splash .sd{margin-top:46px;width:7px;height:7px;border-radius:50%;background:#8c8070;animation:spulse 1.6s ease-in-out infinite}
+#splash.ready .sd{display:none}
+#splash .sv{position:absolute;bottom:calc(28px + env(safe-area-inset-bottom));font-size:11.5px;color:#5f5b54;letter-spacing:.5px;text-align:center;padding:0 24px}
+@keyframes sfade{to{opacity:1}}
+@keyframes spulse{0%,100%{opacity:.25;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}
+.list{margin-top:10px;font-size:13px;color:var(--ink2);line-height:1.8}
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="cv"></canvas>
+  <div class="top">
+    <div class="brand"><button class="spn" id="spName">📖 말씀정원</button><div class="live"><span class="dot" id="dot"></span><span id="online">연결 중…</span></div></div>
+    <div class="camp"><span class="grp" id="grp"></span><b id="campTitle">—</b> <span id="campProg"></span></div>
+    <div class="bar" id="bar"><i id="barFill"></i></div>
+    <div class="mode" id="mode"></div><div class="mode" id="nowHymn" style="display:none"></div>
+  </div>
+  <div class="feed" id="feed"></div>
+  <div class="svc" id="svc"><div class="svh"><b id="svT"></b><span id="svR"></span><button id="svX">접기</button></div><div class="svb" id="svB"></div></div>
+  <div class="closed" id="closed"><div style="font-size:44px">🕊️</div><h3 id="clT"></h3><div class="w" id="clW"></div><div class="l" id="clL"></div>
+    <button class="btn main" id="clPrac">예배 순서 미리 따라가 보기</button><button class="btn" id="clPray">🕯️ 24시간 기도실로 가기</button><button class="btn" id="clMove" style="background:transparent;color:#efe7d6;box-shadow:none">다른 공간 보기</button></div>
+  <div class="hint" id="hint">바닥을 눌러 걸어보세요 · 빛나는 성경에 다가가면 이어 쓸 수 있어요</div>
+  <div class="hud">
+    <button class="btn icon" id="bName" title="메뉴">☰</button>
+    <button class="btn main" id="bWrite">✍️ 이어쓰기</button>
+    <button class="btn icon" id="bPray" title="앉아서 기도">🙏</button>
+    <button class="btn icon" id="bSound" title="찬송">🔇</button>
+    <button class="btn icon" id="bAmen" title="아멘">🕊️</button>
+  </div>
+  <div class="veil" id="veil"></div>
+  <div id="splash">
+    <svg viewBox="0 0 64 64" fill="none" stroke="#8c8070" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M32 3v11M27.5 7.5h9"/><path d="M12 30 32 14l20 16"/><path d="M17 26v28h30V26"/><path d="M27 54V43a5 5 0 0 1 10 0v11"/><path d="M10 54h44"/>
+    </svg>
+    <h2>말씀정원</h2>
+    <div class="ss" id="splashSub">예배당 문을 여는 중</div>
+    <div class="sd"></div>
+    <div class="sv">개역한글 성경 · 찬송은 저작권이 만료된 곡의 연주입니다</div>
+  </div>
+  <div class="sheet" id="sheet"><div class="grab"></div><div id="sheetBody"></div></div>
+  <div class="toast" id="toast"></div>
+</div>
+<script>
+const CAMPAIGNS = [{"id":"gen1","title":"창세기 1장","verses":[{"v":1,"t":"태초에 하나님이 천지를 창조하시니라"},{"v":2,"t":"땅이 혼돈하고 공허하며 흑암이 깊음 위에 있고 하나님의 신은 수면에 운행하시니라"},{"v":3,"t":"하나님이 가라사대 빛이 있으라 하시매 빛이 있었고"},{"v":4,"t":"그 빛이 하나님의 보시기에 좋았더라 하나님이 빛과 어두움을 나누사"},{"v":5,"t":"빛을 낮이라 칭하시고 어두움을 밤이라 칭하시니라 저녁이 되며 아침이 되니 이는 첫째 날이니라"},{"v":6,"t":"하나님이 가라사대 물 가운데 궁창이 있어 물과 물로 나뉘게 하리라 하시고"},{"v":7,"t":"하나님이 궁창을 만드사 궁창 아래의 물과 궁창 위의 물로 나뉘게 하시매 그대로 되니라"},{"v":8,"t":"하나님이 궁창을 하늘이라 칭하시니라 저녁이 되며 아침이 되니 이는 둘째 날이니라"},{"v":9,"t":"하나님이 가라사대 천하의 물이 한 곳으로 모이고 뭍이 드러나라 하시매 그대로 되니라"},{"v":10,"t":"하나님이 뭍을 땅이라 칭하시고 모인 물을 바다라 칭하시니라 하나님의 보시기에 좋았더라"},{"v":11,"t":"하나님이 가라사대 땅은 풀과 씨 맺는 채소와 각기 종류대로 씨 가진 열매 맺는 과목을 내라 하시매 그대로 되어"},{"v":12,"t":"땅이 풀과 각기 종류대로 씨 맺는 채소와 각기 종류대로 씨 가진 열매 맺는 나무를 내니 하나님의 보시기에 좋았더라"},{"v":13,"t":"저녁이 되며 아침이 되니 이는 셋째 날이니라"},{"v":14,"t":"하나님이 가라사대 하늘의 궁창에 광명이 있어 주야를 나뉘게 하라 또 그 광명으로 하여 징조와 사시와 일자와 연한이 이루라"},{"v":15,"t":"또 그 광명이 하늘의 궁창에 있어 땅에 비취라 하시고 (그대로 되니라)"},{"v":16,"t":"하나님이 두 큰 광명을 만드사 큰 광명으로 낮을 주관하게 하시고 작은 광명으로 밤을 주관하게 하시며 또 별들을 만드시고"},{"v":17,"t":"하나님이 그것들을 하늘의 궁창에 두어 땅에 비취게 하시며"},{"v":18,"t":"주야를 주관하게 하시며 빛과 어두움을 나뉘게 하시니라 하나님의 보시기에 좋았더라"},{"v":19,"t":"저녁이 되며 아침이 되니 이는 넷째 날이니라"},{"v":20,"t":"하나님이 가라사대 물들은 생물로 번성케 하라 땅 위 하늘의 궁창에는 새가 날으라 하시고"},{"v":21,"t":"하나님이 큰 물고기와 물에서 번성하여 움직이는 모든 생물을 그 종류대로, 날개 있는 모든 새를 그 종류대로 창조하시니 하나님의 보시기에 좋았더라"},{"v":22,"t":"하나님이 그들에게 복을 주어 가라사대 생육하고 번성하여 여러 바다 물에 충만하라 새들도 땅에 번성하라 하시니라"},{"v":23,"t":"저녁이 되며 아침이 되니 이는 다섯째 날이니라"},{"v":24,"t":"하나님이 가라사대 땅은 생물을 그 종류대로 내되 육축과 기는 것과 땅의 짐승을 종류대로 내라 하시고 (그대로 되니라)"},{"v":25,"t":"하나님이 땅의 짐승을 그 종류대로 육축을 그 종류대로 땅에 기는 모든 것을 그 종류대로 만드시니 하나님의 보시기에 좋았더라"},{"v":26,"t":"하나님이 가라사대 우리의 형상을 따라 우리의 모양대로 우리가 사람을 만들고 그로 바다의 고기와 공중의 새와 육축과 온 땅과 땅에 기는 모든 것을 다스리게 하자 하시고"},{"v":27,"t":"하나님이 자기 형상 곧 하나님의 형상대로 사람을 창조하시되 남자와 여자를 창조하시고"},{"v":28,"t":"하나님이 그들에게 복을 주시며 그들에게 이르시되 생육하고 번성하여 땅에 충만하라, 땅을 정복하라, 바다의 고기와 공중의 새와 땅에 움직이는 모든 생물을 다스리라 하시니라"},{"v":29,"t":"하나님이 가라사대 내가 온 지면의 씨 맺는 모든 채소와 씨 가진 열매 맺는 모든 나무를 너희에게 주노니 너희 식물이 되리라"},{"v":30,"t":"또 땅의 모든 짐승과 공중의 모든 새와 생명이 있어 땅에 기는 모든 것에게는 내가 모든 푸른 풀을 식물로 주노라 하시니 그대로 되니라"},{"v":31,"t":"하나님이 그 지으신 모든 것을 보시니 보시기에 심히 좋았더라 저녁이 되며 아침이 되니 이는 여섯째 날이니라"}]},{"id":"psa23","title":"시편 23편","verses":[{"v":1,"t":"여호와는 나의 목자시니 내가 부족함이 없으리로다"},{"v":2,"t":"그가 나를 푸른 초장에 누이시며 쉴만한 물 가으로 인도하시는도다"},{"v":3,"t":"내 영혼을 소생시키시고 자기 이름을 위하여 의의 길로 인도하시는도다"},{"v":4,"t":"내가 사망의 음침한 골짜기로 다닐지라도 해를 두려워하지 않을 것은 주께서 나와 함께 하심이라 주의 지팡이와 막대기가 나를 안위하시나이다"},{"v":5,"t":"주께서 내 원수의 목전에서 내게 상을 베푸시고 기름으로 내 머리에 바르셨으니 내 잔이 넘치나이다"},{"v":6,"t":"나의 평생에 선하심과 인자하심이 정녕 나를 따르리니 내가 여호와의 집에 영원히 거하리로다"}]},{"id":"jhn1","title":"요한복음 1장 1–18절","verses":[{"v":1,"t":"태초에 말씀이 계시니라 이 말씀이 하나님과 함께 계셨으니 이 말씀은 곧 하나님이시니라"},{"v":2,"t":"그가 태초에 하나님과 함께 계셨고"},{"v":3,"t":"만물이 그로 말미암아 지은 바 되었으니 지은 것이 하나도 그가 없이는 된 것이 없느니라"},{"v":4,"t":"그 안에 생명이 있었으니 이 생명은 사람들의 빛이라"},{"v":5,"t":"빛이 어두움에 비취되 어두움이 깨닫지 못하더라"},{"v":6,"t":"하나님께로서 보내심을 받은 사람이 났으니 이름은 요한이라"},{"v":7,"t":"저가 증거하러 왔으니 곧 빛에 대하여 증거하고 모든 사람으로 자기를 인하여 믿게하려 함이라"},{"v":8,"t":"그는 이 빛이 아니요 이 빛에 대하여 증거하러 온 자라"},{"v":9,"t":"참 빛 곧 세상에 와서 각 사람에게 비취는 빛이 있었나니"},{"v":10,"t":"그가 세상에 계셨으며 세상은 그로 말미암아 지은 바 되었으되 세상이 그를 알지 못하였고"},{"v":11,"t":"자기 땅에 오매 자기 백성이 영접지 아니하였으나"},{"v":12,"t":"영접하는 자 곧 그 이름을 믿는 자들에게는 하나님의 자녀가 되는 권세를 주셨으니"},{"v":13,"t":"이는 혈통으로나 육정으로나 사람의 뜻으로 나지 아니하고 오직 하나님께로서 난 자들이니라"},{"v":14,"t":"말씀이 육신이 되어 우리 가운데 거하시매 우리가 그 영광을 보니 아버지의 독생자의 영광이요 은혜와 진리가 충만하더라"},{"v":15,"t":"요한이 그에 대하여 증거하여 외쳐 가로되 내가 전에 말하기를 내 뒤에 오시는 이가 나보다 앞선 것은 나보다 먼저 계심이니라 한 것이 이 사람을 가리킴이라 하니라"},{"v":16,"t":"우리가 다 그의 충만한 데서 받으니 은혜 위에 은혜러라"},{"v":17,"t":"율법은 모세로 말미암아 주신 것이요 은혜와 진리는 예수 그리스도로 말미암아 온 것이라"},{"v":18,"t":"본래 하나님을 본 사람이 없으되 아버지 품 속에 있는 독생하신 하나님이 나타내셨느니라"}]}];
+// ---------- utils ----------
+const $ = id => document.getElementById(id);
+const rnd = (a,b)=>a+Math.random()*(b-a);
+const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));
+const norm = s => (s||"").replace(/[\s.,!?;:'"“”‘’·…\-—–()\[\]]/g,"");
+function ls(k,v){try{if(v===undefined)return JSON.parse(localStorage.getItem(k));localStorage.setItem(k,JSON.stringify(v))}catch(e){return null}}
+const ADJ=["온유한","기쁜","고요한","따뜻한","소망의","새벽","평안한","은혜로운","작은","감사하는","잔잔한","빛나는"];
+const NOUN=["어린양","비둘기","올리브","등불","겨자씨","들꽃","샘물","별빛","무화과","포도나무"];
+const COLORS=["#e98a8a","#8fb996","#7fa7e0","#e8b65a","#b591d9","#f0a35e","#6cc4c0"];
+let me = ls("br_me") || {n:ADJ[Math.random()*ADJ.length|0]+" "+NOUN[Math.random()*NOUN.length|0], c:COLORS[Math.random()*COLORS.length|0]};
+ls("br_me",me);
+
+// ---------- world ----------
+const W=720,H=1100;
+const LECTERN={x:360,y:300};
+const SEATS=[];
+const PEWS=[];
+for(let r=0;r<5;r++){
+  const y=480+r*92;
+  PEWS.push({x:96,y,w:228,h:30});PEWS.push({x:396,y,w:228,h:30});
+  for(let i=0;i<4;i++){SEATS.push({x:96+28+i*57,y:y-6});SEATS.push({x:396+28+i*57,y:y-6});}
+}
+const player={x:360,y:960,tx:360,ty:960,sit:false,face:1,walk:0,seat:null,arrive:null};
+const peers=new Map(); // id -> {n,c,x,y,tx,ty,s,e,w,walk,face}
+const fx=[]; // floating effects
+const motes=[...Array(40)].map(()=>({x:rnd(0,W),y:rnd(0,H),r:rnd(.6,1.8),s:rnd(4,12),p:rnd(0,6)}));
+
+// ---------- relay state ----------
+const done = new Map(); // key "gen1-5" -> {n,c,at}
+let shared=false, db=null, room=null;
+function campState(){
+  for(const c of CAMPAIGNS){
+    const left=c.verses.filter(v=>!done.has(c.id+"-"+v.v));
+    if(left.length) return {c, next:left[0], count:c.verses.length-left.length};
+  }
+  return {c:CAMPAIGNS[CAMPAIGNS.length-1], next:null, count:CAMPAIGNS[CAMPAIGNS.length-1].verses.length};
+}
+function renderTop(){
+  if(space!=="relay"){ renderWorshipTop(); return; }
+  const s=campState();
+  $("campTitle").textContent=s.c.title;
+  $("campProg").textContent=`· ${s.count} / ${s.c.verses.length}절 완성`;
+  $("barFill").style.width=(s.count/s.c.verses.length*100)+"%";
+}
+
+// ---------- 3D scene (three.js) ----------
+const S3=1/40;
+const to3=(x,y)=>({X:(x-360)*S3, Z:(y-550)*S3});
+const to2=(X,Z)=>({x:X/S3+360, y:Z/S3+550});
+let renderer=null, scene, camera, R3={}, camY=0;
+const tapTargets=[]; const people=new Map(); // id -> person obj
+const raycaster = window.THREE ? new THREE.Raycaster() : null;
+function hashStr(s){let h=7;for(const ch of String(s))h=(h*31+ch.charCodeAt(0))|0;return Math.abs(h);}
+function canvasTex(w,h,draw,rep){const c=document.createElement('canvas');c.width=w;c.height=h;draw(c.getContext('2d'),w,h);const t=new THREE.CanvasTexture(c);if(rep){t.wrapS=t.wrapT=THREE.RepeatWrapping;t.repeat.set(rep[0],rep[1]);}t.anisotropy=4;return t;}
+const M=(color,o={})=>new THREE.MeshStandardMaterial(Object.assign({color,roughness:.85,metalness:0},o));
+function box(w,h,d,mat,x,y,z){const m=new THREE.Mesh(new THREE.BoxGeometry(w,h,d),mat);m.position.set(x,y,z);return m;}
+function cyl(rt,rb,h,mat,x,y,z,seg=20){const m=new THREE.Mesh(new THREE.CylinderGeometry(rt,rb,h,seg),mat);m.position.set(x,y,z);return m;}
+function sph(r,mat,x,y,z,seg=20){const m=new THREE.Mesh(new THREE.SphereGeometry(r,seg,Math.max(10,seg*.7|0)),mat);m.position.set(x,y,z);return m;}
+function glowTex(c1){return canvasTex(128,128,(c,w,h)=>{const g=c.createRadialGradient(64,64,0,64,64,64);g.addColorStop(0,c1);g.addColorStop(1,"rgba(255,220,150,0)");c.fillStyle=g;c.fillRect(0,0,w,h);});}
+function glowSprite(size,c1,op=1){const s=new THREE.Sprite(new THREE.SpriteMaterial({map:glowTex(c1),transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:op}));s.scale.set(size,size,1);return s;}
+function textSprite(text,opt={}){
+  const fs=opt.fs||44, pad=18; const c=document.createElement('canvas'); const x=c.getContext('2d');
+  x.font=`${opt.bold?"bold ":""}${fs}px "Gowun Dodum",sans-serif`; const w=Math.ceil(x.measureText(text).width)+pad*2, h=fs+pad*1.2;
+  c.width=w; c.height=h; x.font=`${opt.bold?"bold ":""}${fs}px "Gowun Dodum",sans-serif`;
+  x.fillStyle=opt.bg||"rgba(43,35,64,.78)"; const r=h/2; x.beginPath(); x.moveTo(r,0); x.arcTo(w,0,w,h,r); x.arcTo(w,h,0,h,r); x.arcTo(0,h,0,0,r); x.arcTo(0,0,w,0,r); x.fill();
+  x.fillStyle=opt.color||"#fbf6ec"; x.textAlign="center"; x.textBaseline="middle"; x.fillText(text,w/2,h/2+2);
+  const t=new THREE.CanvasTexture(c); const s=new THREE.Sprite(new THREE.SpriteMaterial({map:t,transparent:true,depthWrite:false,depthTest:opt.depthTest!==false}));
+  const k=(opt.h||.26)/h; s.scale.set(w*k,h*k,1); s.renderOrder=opt.order||5; return s;
+}
+function emojiSprite(e,size=.5){ const c=document.createElement('canvas'); c.width=c.height=96; const x=c.getContext('2d'); x.font='72px serif'; x.textAlign='center'; x.textBaseline='middle'; x.fillText(e,48,54);
+  const s=new THREE.Sprite(new THREE.SpriteMaterial({map:new THREE.CanvasTexture(c),transparent:true,depthWrite:false})); s.scale.set(size,size,1); s.renderOrder=6; return s; }
+
+// textures
+function woodTex(){ return canvasTex(512,512,(c,w,h)=>{ const rows=8; for(let i=0;i<rows;i++){ const y=i*h/rows; for(let x=-(i%2)*128;x<w;x+=256){ const tone=150+Math.random()*30|0; c.fillStyle=`rgb(${tone+40},${tone+5},${tone-45})`; c.fillRect(x,y,256,h/rows); for(let k=0;k<14;k++){ c.strokeStyle=`rgba(90,55,30,${Math.random()*.12})`; c.beginPath(); const yy=y+Math.random()*h/rows; c.moveTo(x,yy); c.bezierCurveTo(x+80,yy+3,x+160,yy-3,x+256,yy); c.stroke(); } c.strokeStyle="rgba(80,50,30,.45)"; c.lineWidth=2; c.strokeRect(x,y,256,h/rows); } } },[4,6]); }
+function wallTex(){ return canvasTex(512,512,(c,w,h)=>{ c.fillStyle="#efe3cc"; c.fillRect(0,0,w,h); for(let i=0;i<900;i++){ c.fillStyle=`rgba(160,130,90,${Math.random()*.05})`; c.fillRect(Math.random()*w,Math.random()*h,3,3);} const wy=h*.74; c.fillStyle="#9a6a45"; c.fillRect(0,wy,w,h-wy); for(let x=0;x<w;x+=64){ c.strokeStyle="rgba(60,35,20,.45)"; c.lineWidth=3; c.strokeRect(x+6,wy+10,52,h-wy-20);} c.fillStyle="#7a4f33"; c.fillRect(0,wy-8,w,10); },[3,1]); }
+function glassTex(seed){ return canvasTex(256,512,(c,w,h)=>{ c.clearRect(0,0,w,h); c.save(); c.beginPath(); c.moveTo(10,h-6); c.lineTo(10,130); c.quadraticCurveTo(10,10,w/2,8); c.quadraticCurveTo(w-10,10,w-10,130); c.lineTo(w-10,h-6); c.closePath(); c.clip();
+  const cols=["#e98a8a","#7fa7e0","#e8b65a","#8fb996","#b591d9","#f6d892","#6cc4c0"]; let r=seed;
+  for(let y=0;y<h;y+=46) for(let x=0;x<w;x+=42){ r=(r*9301+49297)%233280; c.fillStyle=cols[r%cols.length]; c.globalAlpha=.85; c.fillRect(x,y,42,46); }
+  c.globalAlpha=1; c.strokeStyle="#2b2340"; c.lineWidth=5; for(let y=0;y<h;y+=46){c.beginPath();c.moveTo(0,y);c.lineTo(w,y);c.stroke();} for(let x=0;x<w;x+=42){c.beginPath();c.moveTo(x,0);c.lineTo(x,h);c.stroke();}
+  c.fillStyle="rgba(255,250,220,.9)"; c.fillRect(w/2-7,150,14,190); c.fillRect(w/2-50,205,100,14);
+  c.restore(); c.strokeStyle="#3a2f4d"; c.lineWidth=12; c.beginPath(); c.moveTo(10,h-6); c.lineTo(10,130); c.quadraticCurveTo(10,10,w/2,8); c.quadraticCurveTo(w-10,10,w-10,130); c.lineTo(w-10,h-6); c.stroke(); }); }
+
+function build3D(){
+  if(!window.THREE){ return false; }
+  renderer=new THREE.WebGLRenderer({canvas:cv,antialias:true});
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio||1,2));
+  renderer.outputEncoding=THREE.sRGBEncoding; renderer.toneMapping=THREE.ACESFilmicToneMapping; renderer.toneMappingExposure=1.05;
+  scene=new THREE.Scene();
+  camera=new THREE.PerspectiveCamera(52,1,.1,120);
+  // lights
+  R3.hemi=new THREE.HemisphereLight(0xfff3e0,0x6a4a35,.8); scene.add(R3.hemi);
+  R3.sun=new THREE.DirectionalLight(0xffe2b8,.7); R3.sun.position.set(-6,12,4); scene.add(R3.sun);
+  R3.front=new THREE.PointLight(0xffd7a0,1.2,16,2); R3.front.position.set(0,4.5,-8.6); scene.add(R3.front);
+  // floor / walls / ceiling
+  const zF=-10.75, zB=13.75, xL=-9, xR=9, HW=7.2;
+  const floor=new THREE.Mesh(new THREE.PlaneGeometry(18,zB-zF),M(0xffffff,{map:woodTex(),roughness:.7}));
+  floor.rotation.x=-Math.PI/2; floor.position.set(0,0,(zF+zB)/2); floor.userData.tag="floor"; scene.add(floor); R3.floor=floor;
+  const wm=M(0xffffff,{map:wallTex(),roughness:.95});
+  const wl=new THREE.Mesh(new THREE.PlaneGeometry(zB-zF,HW),wm); wl.rotation.y=Math.PI/2; wl.position.set(xL,HW/2,(zF+zB)/2); scene.add(wl);
+  const wr=wl.clone(); wr.rotation.y=-Math.PI/2; wr.position.x=xR; scene.add(wr);
+  const wmF=M(0xffffff,{map:wallTex(),roughness:.95}); wmF.map=wallTex(); wmF.map.repeat.set(2,1);
+  const wf=new THREE.Mesh(new THREE.PlaneGeometry(18,HW),wmF); wf.position.set(0,HW/2,zF); scene.add(wf);
+  const ceil=new THREE.Mesh(new THREE.PlaneGeometry(18,zB-zF),M(0x8a5e40,{map:woodTex(),roughness:.9})); ceil.rotation.x=Math.PI/2; ceil.position.set(0,HW,(zF+zB)/2); scene.add(ceil);
+  for(let z=zF+2;z<zB;z+=3.2){ const beam=box(18,.35,.35,M(0x6b4630),0,HW-.18,z); scene.add(beam); }
+  // carpet
+  const carpet=new THREE.Mesh(new THREE.PlaneGeometry(1.8,zB-(-4.4)),M(0x9c3b4a,{roughness:1})); carpet.rotation.x=-Math.PI/2; carpet.position.set(0,.012,(-4.4+zB)/2); scene.add(carpet);
+  const trim=new THREE.Mesh(new THREE.PlaneGeometry(1.55,zB-(-4.4)),M(0x7d2c3b,{roughness:1})); trim.rotation.x=-Math.PI/2; trim.position.set(0,.016,(-4.4+zB)/2); scene.add(trim);
+  // side stained glass + light shafts
+  R3.glass=[];
+  [-6.5,-1,4.5,10].forEach((z,i)=>{ for(const side of [-1,1]){
+    const gm=new THREE.MeshBasicMaterial({map:glassTex(i*7+(side>0?3:0)+1),transparent:true,side:THREE.DoubleSide});
+    const g=new THREE.Mesh(new THREE.PlaneGeometry(1.5,3),gm); g.position.set(side*8.98,4,z); g.rotation.y=side>0?-Math.PI/2:Math.PI/2; scene.add(g); R3.glass.push(gm);
+    const shaft=new THREE.Mesh(new THREE.PlaneGeometry(1.4,6),new THREE.MeshBasicMaterial({map:canvasTex(64,256,(c,w,h)=>{const gr=c.createLinearGradient(0,0,0,h);gr.addColorStop(0,"rgba(255,240,200,.55)");gr.addColorStop(1,"rgba(255,240,200,0)");c.fillStyle=gr;c.fillRect(0,0,w,h);}),transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,side:THREE.DoubleSide,opacity:.35}));
+    shaft.position.set(side*6.6,2.4,z+.6); shaft.rotation.set(0,side>0?-Math.PI/2:Math.PI/2,0); shaft.rotateX(-.75*side*0); shaft.rotation.z=side*0.75; scene.add(shaft); (R3.shafts=R3.shafts||[]).push(shaft.material);
+  }});
+  // chancel
+  const plat=box(12,.4,6.2,M(0xc7ae86),0,.2,-7.65); scene.add(plat);
+  const step=box(5,.2,.6,M(0xb89c74),0,.1,-4.3); scene.add(step);
+  // cross on front wall
+  const crossM=M(0x7a4a2c,{roughness:.6});
+  const cross=new THREE.Group(); cross.add(box(.42,5.2,.3,crossM,0,0,0)); cross.add(box(2.6,.42,.3,crossM,0,1.2,0)); cross.position.set(0,4.1,zF+.25); scene.add(cross);
+  const cg=glowSprite(7,"rgba(255,236,190,.9)",.7); cg.position.set(0,4.4,zF+.1); scene.add(cg); R3.crossGlow=cg;
+  // Jesus figure
+  R3.jesus=makeJesus(); R3.jesus.position.set(0,.4,-9.3); scene.add(R3.jesus);
+  // altar
+  const altar=new THREE.Group();
+  altar.add(box(3.4,1.05,1.1,M(0x7a4f36),0,.52,0)); altar.add(box(3.6,.06,1.25,M(0xfbf3e2),0,1.07,0)); altar.add(box(.5,.9,1.27,M(0xb23a48),0,.65,0));
+  altar.add(box(.9,.12,.6,M(0x5a2a34),.9,1.16,0)); // closed bible on altar
+  altar.position.set(0,.4,-7.4); scene.add(altar);
+  R3.flames=[];
+  for(const x of [-1.35,1.35]){ altar.add(cyl(.08,.08,.6,M(0xf7efe0),x,1.4,0)); const f=flame(.09); f.position.set(x,1.78,0); altar.add(f); R3.flames.push(f); const gs=glowSprite(.9,"rgba(255,210,140,.95)"); gs.position.set(x,1.78,0); altar.add(gs); }
+  altar.traverse(o=>{o.userData.tag="altar";}); tapTargets.push(altar);
+  // prayer candle rack
+  const rack=new THREE.Group(); rack.position.set(-3.6,.4,-5.5);
+  for(let r=0;r<3;r++) rack.add(box(3.2,.12,.32,M(0x5a3d2a),0,.35+r*.28,-r*.32));
+  rack.add(box(3.3,.35,.95,M(0x4a3020),0,.17,-.32));
+  R3.pc=[]; for(let i=0;i<36;i++){ const r=Math.floor(i/12), k=i%12; const g=new THREE.Group(); g.add(cyl(.045,.045,.16,M(0xf7efe0),0,.08,0,10)); const f=flame(.04); f.position.y=.22; g.add(f); const gs=glowSprite(.35,"rgba(255,210,140,.9)"); gs.position.y=.22; g.add(gs); g.position.set(-1.45+k*.265,.41+r*.28,-r*.32); g.visible=false; rack.add(g); R3.pc.push({g,f}); }
+  rack.traverse(o=>{o.userData.tag="altar";}); scene.add(rack); tapTargets.push(rack); R3.rack=rack;
+  R3.rackLabel=null; R3.rackN=-1;
+  // relay lectern
+  const lec=new THREE.Group();
+  lec.add(cyl(.12,.16,1.1,M(0x6b4630),0,.55,0)); lec.add(cyl(.45,.5,.08,M(0x6b4630),0,.04,0));
+  const top=box(1.3,.08,.9,M(0x5a2a34),0,1.18,0); top.rotation.x=.35; lec.add(top);
+  const pageM=new THREE.MeshStandardMaterial({color:0xfffaf0,emissive:0xffe6b0,emissiveIntensity:.35,roughness:.6});
+  const p1=box(.58,.03,.78,pageM,-.31,1.24,0); p1.rotation.set(.35,0,.08); lec.add(p1); const p2=box(.58,.03,.78,pageM,.31,1.24,0); p2.rotation.set(.35,0,-.08); lec.add(p2); R3.pageM=pageM;
+  const lg=glowSprite(2.6,"rgba(255,236,180,.95)",.8); lg.position.set(0,1.35,0); lec.add(lg); R3.lecGlow=lg;
+  const p3=to3(LECTERN.x,LECTERN.y); lec.position.set(p3.X,.4,p3.Z+.6); lec.traverse(o=>{o.userData.tag="lectern";}); scene.add(lec); tapTargets.push(lec); R3.lectern=lec;
+  R3.lecLabel=null; R3.lecText="";
+  // pews
+  const wood=M(0x8a5a3c,{roughness:.75}), woodD=M(0x6e4429,{roughness:.8});
+  PEWS.forEach((p,i)=>{ const g=new THREE.Group(); const w=p.w*S3; const c=to3(p.x+p.w/2,p.y+15);
+    g.add(box(w,.1,.55,wood,0,.45,0)); g.add(box(w,.75,.09,woodD,0,.85,.28)); g.add(box(.09,.85,.62,woodD,-w/2,.42,0)); g.add(box(.09,.85,.62,woodD,w/2,.42,0));
+    g.position.set(c.X,0,c.Z); g.traverse(o=>{o.userData.tag="pew";o.userData.i=i;}); scene.add(g); tapTargets.push(g); });
+  // plants
+  for(const [x,z] of [[-8,-3.5],[8,-3.5],[-8,12.5],[8,12.5]]){ scene.add(cyl(.35,.28,.6,M(0xb87d5a),x,.3,z)); for(const [dx,dy,dz,r] of [[0,1.1,0,.55],[.3,.85,.2,.4],[-.3,.9,-.1,.42],[0,1.5,0,.35]]) scene.add(sph(r,M(0x5e9b6b),x+dx,dy,z+dz,14)); }
+  // dust motes
+  const N=180, pos=new Float32Array(N*3); for(let i=0;i<N;i++){pos[i*3]=rnd(-8.5,8.5);pos[i*3+1]=rnd(.3,6.5);pos[i*3+2]=rnd(-10,13);}
+  const pg=new THREE.BufferGeometry(); pg.setAttribute("position",new THREE.BufferAttribute(pos,3));
+  R3.motes=new THREE.Points(pg,new THREE.PointsMaterial({size:.07,map:glowTex("rgba(255,245,215,1)"),transparent:true,depthWrite:false,blending:THREE.AdditiveBlending,opacity:.7})); scene.add(R3.motes);
+  R3.fx=[];
+  applySpaceLook();
+  return true;
+}
+function flame(r){ const m=new THREE.Mesh(new THREE.ConeGeometry(r,r*3.2,10),new THREE.MeshBasicMaterial({color:0xffb84a})); return m; }
+function makeJesus(){
+  const g=new THREE.Group();
+  const robe=M(0xf6f0e4,{roughness:.8}), mantle=M(0xb23a48,{roughness:.8}), skin=M(0xe9c4a0), hair=M(0x5a3a24);
+  g.add(cyl(.55,.62,.35,M(0xd8c8a8),0,.17,0)); // pedestal
+  g.add(cyl(.32,.62,1.9,robe,0,1.3,0,24));
+  const mt=new THREE.Mesh(new THREE.CylinderGeometry(.36,.68,1.75,24,1,true,Math.PI*0.15,Math.PI*1.05),mantle); mt.material.side=THREE.DoubleSide; mt.position.set(0,1.35,-.02); mt.rotation.y=Math.PI*.55; g.add(mt);
+  g.add(box(.12,1.2,.05,M(0xb23a48),.12,1.6,.27).rotateZ(.5));
+  g.add(sph(.34,robe,0,2.22,0)); // shoulders
+  for(const s of [-1,1]){ const arm=new THREE.Group(); arm.position.set(s*.33,2.25,0); const a=cyl(.11,.15,.85,robe,0,-.42,0); arm.add(a); const h=sph(.09,skin,0,-.88,0); arm.add(h); arm.rotation.z=s*.75; arm.rotation.x=-.25; g.add(arm); }
+  g.add(cyl(.09,.1,.18,skin,0,2.5,0));
+  const head=sph(.27,skin,0,2.78,0); head.scale.set(1,1.1,1); g.add(head);
+  const hb=sph(.3,hair,0,2.82,-.06); hb.scale.set(1.02,1.12,1); g.add(hb);
+  const hl=sph(.2,hair,0,2.5,-.12); hl.scale.set(1.4,1.6,.8); g.add(hl);
+  const beard=sph(.16,hair,0,2.6,.13); beard.scale.set(1.1,.9,.7); g.add(beard);
+  for(const s of [-1,1]) g.add(sph(.03,M(0x2b2340),s*.09,2.8,.25,8));
+  const halo=new THREE.Mesh(new THREE.TorusGeometry(.42,.035,10,40),new THREE.MeshBasicMaterial({color:0xf6d892})); halo.position.set(0,2.9,-.25); g.add(halo);
+  const hg=glowSprite(2.2,"rgba(255,230,160,.95)",.75); hg.position.set(0,2.85,-.3); g.add(hg); R3.halo=hg;
+  g.traverse(o=>{o.userData.tag="altar";}); tapTargets.push(g);
+  return g;
+}
+const LOOKS={
+  relay:{bg:0xe6d6bc,hemi:[0xfff3e0,0x6a4a35,.75],sun:.65,front:1.0,glass:1,shaft:.3,fog:[0xe6d6bc,25,60],halo:.45},
+  prayer:{bg:0x0e0a1a,hemi:[0x7a7ab0,0x1a1020,.32],sun:.12,front:2.4,glass:.35,shaft:.06,fog:[0x0e0a1a,14,40],halo:.95},
+  dawn:{bg:0x2a2f5a,hemi:[0x9fb4ff,0x2a2040,.45],sun:.3,front:1.4,glass:.6,shaft:.15,fog:[0x2a2f5a,18,50],halo:.9},
+  wed:{bg:0x241a3a,hemi:[0xb7a0e0,0x2a1a30,.42],sun:.25,front:1.5,glass:.55,shaft:.12,fog:[0x241a3a,18,50],halo:.9},
+  sun:{bg:0xf3ead8,hemi:[0xffffff,0x8a6a50,.9],sun:.85,front:1.0,glass:1,shaft:.4,fog:[0xf3ead8,28,70],halo:.55},
+};
+function applySpaceLook(){
+  if(!renderer) return; const L=LOOKS[space]||LOOKS.relay;
+  scene.background=new THREE.Color(L.bg); scene.fog=new THREE.Fog(L.fog[0],L.fog[1],L.fog[2]);
+  R3.hemi.color.set(L.hemi[0]); R3.hemi.groundColor.set(L.hemi[1]); R3.hemi.intensity=L.hemi[2];
+  R3.sun.intensity=L.sun; R3.front.intensity=L.front;
+  R3.glass.forEach(m=>m.color.setScalar(L.glass)); (R3.shafts||[]).forEach(m=>m.opacity=L.shaft);
+  R3.halo.material.opacity=L.halo;
+  R3.lectern.visible = space==="relay";
+  R3.rack.visible = space!=="relay";
+}
+// ---------- people ----------
+function makePerson(name,shirt,isMe){
+  const h=hashStr(name);
+  const skin=M([0xf6d7bf,0xf0c9a8,0xe8bc98][h%3]), hairM=M([0x3b2a20,0x5a3a28,0x1f1a1a,0x7a5232,0x2e2420][(h>>3)%5]);
+  const shirtM=M(new THREE.Color(shirt)), pants=M([0x7a5a40,0x3d4a63,0x5a5048,0xe9dcc4][(h>>7)%4]);
+  const g=new THREE.Group(), body=new THREE.Group(); g.add(body);
+  const legs=[]; for(const s of [-1,1]){ const lp=new THREE.Group(); lp.position.set(s*.11,.42,0); const l=cyl(.085,.08,.38,pants,0,-.19,0,10); lp.add(l); const shoe=sph(.09,M(0x4a3a30),0,-.38,.04,10); shoe.scale.set(1,.6,1.3); lp.add(shoe); body.add(lp); legs.push(lp); }
+  const torso=cyl(.25,.3,.5,shirtM,0,.66,0); body.add(torso);
+  const arms=[]; for(const s of [-1,1]){ const ap=new THREE.Group(); ap.position.set(s*.3,.86,0); ap.add(cyl(.065,.07,.38,shirtM,0,-.19,0,10)); ap.add(sph(.075,skin,0,-.4,0,10)); ap.rotation.z=s*.18; body.add(ap); arms.push(ap); }
+  const head=new THREE.Group(); head.position.y=1.24; body.add(head);
+  head.add(sph(.38,skin,0,0,0,24));
+  const style=(h>>5)%3;
+  const cap=new THREE.Mesh(new THREE.SphereGeometry(.405,24,16,0,Math.PI*2,0,Math.PI*.52),hairM); cap.position.y=.03; cap.rotation.x=-.25; head.add(cap);
+  if(style===1){ const back=sph(.36,hairM,0,-.08,-.12,18); back.scale.set(1.08,.9,.8); head.add(back); }
+  if(style===2){ head.add(sph(.15,hairM,0,.36,-.18,14)); }
+  for(const s of [-1,1]){ head.add(sph(.04,M(0x2b2340),s*.13,-.02,.35,8)); const b=sph(.06,M(0xf4a6a6,{transparent:true,opacity:.7}),s*.2,-.11,.31,8); b.scale.set(1,.6,.4); head.add(b); }
+  const sh=new THREE.Mesh(new THREE.CircleGeometry(.42,20),new THREE.MeshBasicMaterial({color:0x000000,transparent:true,opacity:.22,depthWrite:false})); sh.rotation.x=-Math.PI/2; sh.position.y=.015; g.add(sh);
+  const label=textSprite(name,{bold:isMe,color:isMe?"#f6d892":"#fbf6ec",h:.24}); label.position.y=1.98; g.add(label);
+  const pray=emojiSprite("🙏",.38); pray.position.set(0,2.32,0); pray.visible=false; g.add(pray);
+  scene.add(g);
+  return {g,body,legs,arms,head,label,pray,name,shirt,phase:Math.random()*6,yaw:Math.PI};
+}
+function syncPerson(id,name,shirt,isMe){
+  let p=people.get(id);
+  if(p&&(p.name!==name||p.shirt!==shirt)){ scene.remove(p.g); p=null; }
+  if(!p){ p=makePerson(name,shirt,isMe); people.set(id,p); }
+  return p;
+}
+function posePerson(p,x,y,moving,sit,dt,t,dirx,diry){
+  const c=to3(x,y);
+  const tz = sit ? c.Z+.52 : c.Z;
+  p.g.position.x+= (c.X-p.g.position.x)*Math.min(1,dt*20); p.g.position.z+=(tz-p.g.position.z)*Math.min(1,dt*20);
+  let want = sit ? Math.PI : (moving ? Math.atan2(dirx,diry) : p.yaw);
+  let d=want-p.yaw; while(d>Math.PI)d-=Math.PI*2; while(d<-Math.PI)d+=Math.PI*2; p.yaw+=d*Math.min(1,dt*10); p.g.rotation.y=p.yaw;
+  const sw=moving?Math.sin(t*10+p.phase):0;
+  if(sit){ p.legs.forEach(l=>{l.rotation.x=-1.45;}); p.body.position.y=.05;
+    p.arms.forEach((a,i)=>{const s=i?1:-1; a.rotation.x=-1.25; a.rotation.z=-s*.42;}); p.head.rotation.x=.18; }
+  else { p.legs[0].rotation.x=sw*.6; p.legs[1].rotation.x=-sw*.6; p.arms[0].rotation.x=-sw*.5; p.arms[1].rotation.x=sw*.5; p.arms[0].rotation.z=-.18; p.arms[1].rotation.z=.18;
+    p.body.position.y=moving?Math.abs(Math.sin(t*10+p.phase))*.06:Math.sin(t*2+p.phase)*.01; p.head.rotation.x=0; }
+  p.pray.visible=sit; if(sit) p.pray.position.y=2.32+Math.sin(t*2+p.phase)*.04;
+}
+// ---------- effects ----------
+function sparkle(x,y,n=40){ if(!renderer) return; const c=to3(x,y); const N=n; const pos=new Float32Array(N*3), vel=[];
+  for(let i=0;i<N;i++){pos[i*3]=c.X;pos[i*3+1]=1.7;pos[i*3+2]=c.Z+.6; vel.push([rnd(-1.5,1.5),rnd(1,3.5),rnd(-1.5,1.5)]);}
+  const geo=new THREE.BufferGeometry(); geo.setAttribute("position",new THREE.BufferAttribute(pos,3));
+  const pts=new THREE.Points(geo,new THREE.PointsMaterial({size:.18,map:glowTex("rgba(255,236,170,1)"),transparent:true,depthWrite:false,blending:THREE.AdditiveBlending}));
+  scene.add(pts); R3.fx.push({kind:"burst",o:pts,vel,t:0,life:1.6}); }
+function emote(x,y,e){ if(!renderer) return; const c=to3(x,y); const s=emojiSprite(e,.6); s.position.set(c.X,2.2,c.Z); scene.add(s); R3.fx.push({kind:"emo",o:s,t:0,life:1.9}); }
+function updateFx(dt){ for(let i=R3.fx.length-1;i>=0;i--){ const f=R3.fx[i]; f.t+=dt; const k=f.t/f.life;
+  if(k>=1){ scene.remove(f.o); f.o.material.map&&f.o.material.map.dispose(); f.o.material.dispose(); f.o.geometry&&f.o.geometry.dispose(); R3.fx.splice(i,1); continue; }
+  if(f.kind==="emo"){ f.o.position.y+=dt*.7; f.o.material.opacity=1-k; }
+  else { const a=f.o.geometry.attributes.position; for(let j=0;j<f.vel.length;j++){ a.array[j*3]+=f.vel[j][0]*dt; a.array[j*3+1]+=f.vel[j][1]*dt; a.array[j*3+2]+=f.vel[j][2]*dt; f.vel[j][1]-=3*dt; } a.needsUpdate=true; f.o.material.opacity=1-k; } } }
+function updateLabels(){
+  if(space==="relay"){ const s=campState(); const txt=s.next?`다음: ${s.c.title.split(" ")[0]} ${s.next.v}절 · 눌러서 이어쓰기`:"모든 릴레이 완주!";
+    if(txt!==R3.lecText){ R3.lecText=txt; if(R3.lecLabel) R3.lectern.remove(R3.lecLabel); R3.lecLabel=textSprite(txt,{h:.3,bg:"rgba(90,42,52,.85)",color:"#f6d892"}); R3.lecLabel.position.set(0,2.1,0); R3.lectern.add(R3.lecLabel); }
+    R3.pageM.emissiveIntensity=.3+.9*(s.count/s.c.verses.length); }
+  const n=Math.min(prayers.size,36);
+  if(n!==R3.rackN){ R3.rackN=n; R3.pc.forEach((c,i)=>c.g.visible=i<n);
+    if(R3.rackLabel) R3.rack.remove(R3.rackLabel); R3.rackLabel=textSprite(prayers.size?`기도의 촛불 ${prayers.size}개 · 눌러서 함께 기도`:"눌러서 기도제목 올리기",{h:.28,bg:"rgba(43,35,64,.85)",color:"#f6d892"}); R3.rackLabel.position.set(0,1.55,-.3); R3.rack.add(R3.rackLabel); }
+}
+// ---------- loop ----------
+let vw=0,vh=0;
+function resize(){ vw=cv.clientWidth; vh=cv.clientHeight; if(!renderer) return; renderer.setSize(vw,vh,false); camera.aspect=vw/vh; camera.fov = vw/vh<.7?60:50; camera.updateProjectionMatrix(); }
+let last=performance.now(), T=0, labelT=0;
+const camPos=new (window.THREE?THREE.Vector3:Object)(), camLook=new (window.THREE?THREE.Vector3:Object)();
+function frame(now){
+  const dt=Math.min(.05,(now-last)/1000); last=now; T+=dt;
+  const dx=player.tx-player.x, dy=player.ty-player.y, d=Math.hypot(dx,dy);
+  const moving=d>2;
+  if(moving){ const sp=150*dt; player.x+=dx/d*Math.min(sp,d); player.y+=dy/d*Math.min(sp,d); player.walk+=dt; player.sit=false; player.dx=dx; player.dy=dy; }
+  else if(player.arrive){ const a=player.arrive; player.arrive=null; a(); }
+  peers.forEach(p=>{const ex=p.tx-p.x,ey=p.ty-p.y,dd=Math.hypot(ex,ey); p.moving=dd>1.5; if(p.moving){const sp=Math.max(150,dd*3)*dt;p.x+=ex/dd*Math.min(sp,dd);p.y+=ey/dd*Math.min(sp,dd);p.dx=ex;p.dy=ey;}});
+  if(renderer){
+    // people
+    const alive=new Set(["me"]);
+    const mp=syncPerson("me",me.n,me.c,true); posePerson(mp,player.x,player.y,moving,player.sit,dt,T,player.dx||0,player.dy||1);
+    peers.forEach((p,id)=>{ alive.add(id); const pp=syncPerson(id,p.n,p.c,false); if(!pp.placed){ const c=to3(p.x,p.y); pp.g.position.set(c.X,0,c.Z); pp.placed=true; } posePerson(pp,p.x,p.y,p.moving,p.s&&!p.moving,dt,T,p.dx||0,p.dy||1); });
+    for(const [id,pp] of people) if(!alive.has(id)){ scene.remove(pp.g); people.delete(id); }
+    if(!mp.placed){ const c=to3(player.x,player.y); mp.g.position.set(c.X,0,c.Z); mp.placed=true; }
+    // camera follow
+    const c=to3(player.x,player.y); const back=player.sit?6.2:7.4;
+    camPos.set(c.X*.55, player.sit?4.4:5.0, Math.min(c.Z+back,17));
+    camLook.set(c.X*.75, 1.6, c.Z-4.5);
+    if(!R3.camInit){ camera.position.copy(camPos); R3.look=camLook.clone(); R3.camInit=true; }
+    camera.position.lerp(camPos,Math.min(1,dt*3)); R3.look.lerp(camLook,Math.min(1,dt*3)); camera.lookAt(R3.look);
+    // ambience
+    R3.flames.forEach((f,i)=>{f.scale.y=1+Math.sin(T*11+i*2)*.15;}); R3.pc.forEach((p,i)=>{ if(p.g.visible) p.f.scale.y=1+Math.sin(T*9+i)*.18; });
+    R3.front.intensity=(LOOKS[space]||LOOKS.relay).front*(1+Math.sin(T*7)*.04);
+    R3.halo.scale.setScalar(2.2+Math.sin(T*1.5)*.12); R3.crossGlow.material.opacity=(space==="relay"||space==="sun"?.32:.55)+Math.sin(T*1.2)*.1;
+    if(space==="relay") R3.lecGlow.scale.setScalar(2.4+Math.sin(T*2.2)*.25);
+    if(space==="dawn"){ const k=(curStep("dawn").prog||0); R3.sun.color.setRGB(1,.75+k*.2,.55+k*.3); R3.sun.intensity=.25+k*.6; R3.hemi.intensity=.4+k*.4; }
+    const mp2=R3.motes.geometry.attributes.position; for(let i=0;i<mp2.count;i++){ let y=mp2.array[i*3+1]+dt*.12; if(y>6.8) y=.3; mp2.array[i*3+1]=y; } mp2.needsUpdate=true;
+    updateFx(dt);
+    labelT+=dt; if(labelT>.5){ labelT=0; updateLabels(); }
+    renderer.render(scene,camera);
+  }
+  requestAnimationFrame(frame);
+}
+// ---------- input ----------
+let hintHidden=false, downAt=null;
+cv.addEventListener("pointerdown",ev=>{ downAt={x:ev.clientX,y:ev.clientY,t:Date.now()}; if(!hintHidden){hintHidden=true;$("hint").style.opacity=0;} audioGesture(); });
+cv.addEventListener("pointerup",ev=>{
+  if(!downAt||Math.hypot(ev.clientX-downAt.x,ev.clientY-downAt.y)>12){ downAt=null; return; } downAt=null;
+  if(!renderer) return;
+  const r=cv.getBoundingClientRect(); const ndc=new THREE.Vector2(((ev.clientX-r.left)/r.width)*2-1, -((ev.clientY-r.top)/r.height)*2+1);
+  raycaster.setFromCamera(ndc,camera);
+  const hits=raycaster.intersectObjects([...tapTargets.filter(o=>o.visible),R3.floor],true);
+  for(const h of hits){ const tag=h.object.userData.tag;
+    if(tag==="lectern"&&space==="relay"){ goToBook(); return; }
+    if(tag==="altar"){ if(space==="relay") goToBook(); else goToAltar(); return; }
+    if(tag==="pew"){ const q=to2(h.point.x,h.point.z); let best=null,bd=1e9; for(const s of SEATS){const dd=Math.hypot(s.x-q.x,(s.y)-(q.y-21)); if(dd<bd){bd=dd;best=s;}} moveTo(best.x,best.y,()=>{player.sit=true;dirty();setPray(true);}); return; }
+    if(tag==="floor"){ const q=to2(h.point.x,h.point.z); moveTo(clamp(q.x,70,W-70),clamp(q.y,380,H-60)); return; }
+  }
+});
+
+// ---------- 찬송 (public-domain melodies, organ synth) ----------
+const HYMNS=[
+  {t:"고요한 밤 거룩한 밤",bpm:76,tr:0,key:48,s:"G4:1.5 A4:.5 G4:1 E4:3 G4:1.5 A4:.5 G4:1 E4:3 D5:2 D5:1 B4:3 C5:2 C5:1 G4:3 A4:2 A4:1 C5:1.5 B4:.5 A4:1 G4:1.5 A4:.5 G4:1 E4:3 A4:2 A4:1 C5:1.5 B4:.5 A4:1 G4:1.5 A4:.5 G4:1 E4:3 D5:2 D5:1 F5:1.5 D5:.5 B4:1 C5:3 E5:3 C5:1 G4:1 E4:1 G4:1.5 F4:.5 D4:1 C4:6"},
+  {t:"나 같은 죄인 살리신",bpm:66,tr:0,key:43,s:"D4:1 G4:2 B4:.5 G4:.5 B4:2 A4:1 G4:2 E4:1 D4:2 D4:1 G4:2 B4:.5 G4:.5 B4:2 A4:1 D5:3 D5:2 B4:1 D5:1.5 B4:.5 G4:1 B4:2 A4:1 G4:2 E4:1 D4:2 D4:1 G4:2 B4:.5 G4:.5 B4:2 A4:1 G4:3"},
+  {t:"만복의 근원 하나님",bpm:70,tr:0,key:43,s:"G4:2 G4:1 F#4:1 E4:1 D4:1 G4:1 A4:1 B4:2 B4:2 B4:1 B4:1 A4:1 G4:1 C5:1 B4:1 A4:2 G4:2 A4:1 B4:1 A4:1 G4:1 E4:1 F#4:1 G4:2 D5:2 B4:1 G4:1 A4:1 C5:1 B4:1 A4:1 G4:4"},
+  {t:"예수 사랑하심은",bpm:84,tr:0,key:48,s:"G4:1 E4:1 E4:1 D4:1 E4:1 G4:1 G4:2 A4:1 A4:1 C5:1 A4:1 A4:1 G4:1 G4:2 G4:1 E4:1 E4:1 D4:1 E4:1 G4:1 G4:2 A4:1 A4:1 G4:1 C4:1 E4:1 D4:1 C4:2 G4:2 E4:1 G4:1 A4:1 C5:3 G4:2 E4:1 G4:1 A4:1 C5:3 G4:2 E4:1 G4:1 A4:1 C5:2 A4:1 G4:1 C4:1 E4:1 D4:1 C4:4"},
+  {t:"기뻐하며 경배하세",bpm:80,tr:5,key:53,s:"E4:1 E4:1 F4:1 G4:1 G4:1 F4:1 E4:1 D4:1 C4:1 C4:1 D4:1 E4:1 E4:1.5 D4:.5 D4:2 E4:1 E4:1 F4:1 G4:1 G4:1 F4:1 E4:1 D4:1 C4:1 C4:1 D4:1 E4:1 D4:1.5 C4:.5 C4:2 D4:1 D4:1 E4:1 C4:1 D4:1 E4:.5 F4:.5 E4:1 C4:1 D4:1 E4:.5 F4:.5 E4:1 D4:1 C4:1 D4:1 G3:2 E4:1 E4:1 F4:1 G4:1 G4:1 F4:1 E4:1 D4:1 C4:1 C4:1 D4:1 E4:1 D4:1.5 C4:.5 C4:4"},
+];
+const NOTE={C:0,"C#":1,D:2,"D#":3,E:4,F:5,"F#":6,G:7,"G#":8,A:9,"A#":10,B:11};
+function midiOf(n){ const m=n.match(/^([A-G]#?)(\d)$/); return 12*(+m[2]+1)+NOTE[m[1]]; }
+const TL=[]; let TL_LEN=0;
+(function buildTimeline(){ let t=0; HYMNS.forEach((h,hi)=>{ const sp=60/h.bpm; const start=t; h.s.split(/\s+/).forEach(tok=>{ const [n,b]=tok.split(":"); const dur=+b*sp; TL.push({t,dur,m:midiOf(n)+h.tr,h:hi}); t+=dur; }); h.start=start; h.end=t; TL.push({t:start,dur:t-start,drone:h.key+h.tr*0,h:hi}); t+=5; }); TL_LEN=t; })();
+let actx=null, master=null, audioOn=ls("br_audio")===true, schedT=null, scheduled=new Set(), curHymn=-1;
+function impulse(sec){ const r=actx.sampleRate, len=r*sec, b=actx.createBuffer(2,len,r); for(let ch=0;ch<2;ch++){ const d=b.getChannelData(ch); for(let i=0;i<len;i++) d[i]=(Math.random()*2-1)*Math.pow(1-i/len,2.6); } return b; }
+let unlockEl=null;
+function silentWavURL(){ const sr=8000,n=sr/2,buf=new ArrayBuffer(44+n),v=new DataView(buf); const w=(o,s)=>{for(let i=0;i<s.length;i++)v.setUint8(o+i,s.charCodeAt(i));};
+  w(0,"RIFF");v.setUint32(4,36+n,true);w(8,"WAVE");w(12,"fmt ");v.setUint32(16,16,true);v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr,true);v.setUint16(32,1,true);v.setUint16(34,8,true);w(36,"data");v.setUint32(40,n,true);for(let i=0;i<n;i++)v.setUint8(44+i,128);
+  return URL.createObjectURL(new Blob([buf],{type:"audio/wav"})); }
+function unlockIOS(){ // 아이폰 무음 모드에서도 소리가 나도록 '미디어 재생'으로 전환
+  try{ if(navigator.audioSession) navigator.audioSession.type="playback"; }catch(e){}
+  try{ if(!unlockEl){ unlockEl=document.createElement("audio"); unlockEl.src=silentWavURL(); unlockEl.loop=true; unlockEl.setAttribute("playsinline",""); unlockEl.volume=.01; document.body.appendChild(unlockEl); }
+    const pr=unlockEl.play(); if(pr&&pr.catch) pr.catch(()=>{}); }catch(e){} }
+function chime(){ if(!actx) return; const t0=actx.currentTime+.05; [[72,0],[76,.18],[79,.36]].forEach(([m,d])=>{ const f=440*Math.pow(2,(m-69)/12); const g=actx.createGain(); g.gain.setValueAtTime(0,t0+d); g.gain.linearRampToValueAtTime(.28,t0+d+.02); g.gain.exponentialRampToValueAtTime(.001,t0+d+2.2); g.connect(master); const o=actx.createOscillator(); o.type="sine"; o.frequency.value=f; o.connect(g); o.start(t0+d); o.stop(t0+d+2.3); }); }
+function initAudio(){ if(actx) return true; try{ actx=new (window.AudioContext||window.webkitAudioContext)(); }catch(e){ return false; }
+  master=actx.createGain(); master.gain.value=0; const rev=actx.createConvolver(); rev.buffer=impulse(3.4); const wet=actx.createGain(); wet.gain.value=.55; const dry=actx.createGain(); dry.gain.value=.55;
+  const lp=actx.createBiquadFilter(); lp.type="lowpass"; lp.frequency.value=2600; master.connect(lp); lp.connect(dry).connect(actx.destination); lp.connect(rev); rev.connect(wet).connect(actx.destination); return true; }
+function organ(m,t,dur,vel){ const f=440*Math.pow(2,(m-69)/12); const g=actx.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(vel,t+.07); g.gain.setValueAtTime(vel,t+Math.max(.08,dur*.88)); g.gain.linearRampToValueAtTime(0,t+dur+.35); g.connect(master);
+  for(const [k,a] of [[1,1],[2,.42],[3,.16],[4,.1],[.5,.22]]){ const o=actx.createOscillator(); o.type="sine"; o.frequency.value=f*k; const og=actx.createGain(); og.gain.value=a; o.connect(og).connect(g); o.start(t); o.stop(t+dur+.4); } }
+function drone(key,t,dur){ for(const [m,v] of [[key-12,.16],[key-5,.09]]){ const f=440*Math.pow(2,(m-69)/12); const g=actx.createGain(); g.gain.setValueAtTime(0,t); g.gain.linearRampToValueAtTime(v,t+2); g.gain.setValueAtTime(v,t+Math.max(2.1,dur-2)); g.gain.linearRampToValueAtTime(0,t+dur+1); g.connect(master); const o=actx.createOscillator(); o.type="triangle"; o.frequency.value=f; o.connect(g); o.start(t); o.stop(t+dur+1.2); } }
+function schedule(){
+  if(!actx||!audioOn) return;
+  const now=Date.now()/1000, cyc=Math.floor(now/TL_LEN), pos=now-cyc*TL_LEN, ahead=2.5;
+  for(const [ci,base] of [[cyc,0],[cyc+1,TL_LEN]]){
+    for(let i=0;i<TL.length;i++){ const e=TL[i]; const rel=e.t+base-pos; if(rel<-0.05||rel>ahead) continue; const key=ci+":"+i; if(scheduled.has(key)) continue; scheduled.add(key);
+      const at=actx.currentTime+Math.max(0,rel);
+      if(e.drone!==undefined) drone(e.drone,at,e.dur); else organ(e.m,at,e.dur,.3);
+    }
+  }
+  if(scheduled.size>4000) scheduled=new Set([...scheduled].slice(-600));
+  const h=HYMNS.findIndex(h=>pos>=h.start&&pos<h.end+5);
+  if(h!==curHymn){ curHymn=h; if(h>=0){ pushFeed(`🎵 지금 흐르는 찬송 · ${HYMNS[h].t} (연주)`); $("nowHymn").textContent=`🎵 ${HYMNS[h].t}`; } }
+}
+function setAudio(on){
+  audioOn=on; ls("br_audio",on); $("bSound").classList.toggle("on",on); $("bSound").textContent=on?"🎵":"🔇";
+  $("nowHymn").style.display=on?"block":"none";
+  if(on){ unlockIOS(); if(!initAudio()) return; const go=()=>{ const n=actx.currentTime; master.gain.cancelScheduledValues(n); master.gain.setValueAtTime(master.gain.value,n); master.gain.linearRampToValueAtTime(1,n+.8); chime(); curHymn=-1; scheduled.clear(); schedule(); };
+    if(actx.state!=="running"&&actx.resume){ actx.resume().then(go,go); } else go();
+    if(!schedT) schedT=setInterval(schedule,300);
+    setTimeout(()=>{ if(audioOn&&actx&&actx.state!=="running") toast("소리가 막혀 있어요.<br><span style='font-size:13px'>화면을 한 번 더 누르거나 🎵 버튼을 다시 눌러 주세요</span>"); },1500); }
+  else if(actx){ const n=actx.currentTime; master.gain.cancelScheduledValues(n); master.gain.setValueAtTime(master.gain.value,n); master.gain.linearRampToValueAtTime(0,n+.6); try{unlockEl&&unlockEl.pause();}catch(e){} setTimeout(()=>{ if(!audioOn&&actx) { actx.suspend&&actx.suspend(); scheduled.clear(); } },700); }
+}
+function audioGesture(){ if(audioOn&&(!actx||actx.state!=="running")) setAudio(true); }
+
+function moveTo(x,y,cb){player.tx=x;player.ty=y;player.arrive=cb||null;player.sit=false;setPray(false);dirty();}
+function goToBook(){ moveTo(LECTERN.x+(player.x<LECTERN.x?-46:46),LECTERN.y+96,openWrite); }
+function setPray(on){$("bPray").classList.toggle("on",on);}
+$("bWrite").onclick=()=>{ if(space!=="relay"){ if(Math.hypot(player.x-LECTERN.x,player.y-LECTERN.y)<170) openPrayerWall(); else goToAltar(); return; } if(Math.hypot(player.x-LECTERN.x,player.y-LECTERN.y)<140) openWrite(); else goToBook(); };
+$("bPray").onclick=()=>{
+  if(player.sit){player.sit=false;setPray(false);dirty();return;}
+  let best=null,bd=1e9; for(const s of SEATS){const dd=Math.hypot(s.x-player.x,s.y-player.y); if(dd<bd){bd=dd;best=s;}}
+  moveTo(best.x,best.y,()=>{player.sit=true;setPray(true);dirty();});
+};
+$("bAmen").onclick=()=>{ const e=["🕊️","🙏","💛","✨"][Math.random()*4|0]; emote(player.x,player.y,e); me.e={k:e,t:Date.now()}; dirty(); };
+$("bName").onclick=openMenu;
+
+// ---------- sheet ----------
+const sheet=$("sheet"), veil=$("veil"), body=$("sheetBody");
+function openSheet(html){body.innerHTML=html;sheet.classList.add("show");veil.classList.add("show");}
+function closeSheet(){sheet.classList.remove("show");veil.classList.remove("show");}
+veil.onclick=closeSheet;
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));}
+function openName(){
+  openSheet(`<h2>내 이름</h2><div class="sub">다른 분들에게 보이는 이름이에요. 실명은 쓰지 않아도 괜찮아요.</div>
+  <div class="namebox"><input id="nm" maxlength="12" value="${esc(me.n)}"><button class="btn go" id="nmOk">저장</button></div>
+  <div class="list">스카프 색 <span id="cols"></span></div>`);
+  $("cols").innerHTML=COLORS.map(c=>`<button data-c="${c}" style="width:26px;height:26px;border-radius:50%;border:${c===me.c?"3px solid #2b2340":"2px solid #fff"};background:${c};margin:0 3px;vertical-align:middle;cursor:pointer"></button>`).join("");
+  $("cols").onclick=e=>{const c=e.target.dataset.c;if(c){me.c=c;ls("br_me",me);dirty();openName();}};
+  $("nmOk").onclick=()=>{const v=$("nm").value.trim();if(v){me.n=v;ls("br_me",me);dirty();}closeSheet();};
+}
+function openWrite(){
+  const s=campState();
+  if(!s.next){ openSheet(`<div class="done"><div class="big">🎉</div><h2>모든 릴레이를 함께 완주했어요</h2><div class="sub" style="margin-top:6px">${CAMPAIGNS.map(c=>c.title).join(" · ")}</div></div>`); return; }
+  const prevV=s.c.verses.find(v=>v.v===s.next.v-1);
+  const prevBy=prevV&&done.get(s.c.id+"-"+prevV.v);
+  openSheet(`<h2>${esc(s.c.title)} 릴레이</h2>
+    <div class="sub">앞 사람의 구절을 이어 한 절을 필사해 주세요 · 개역한글</div>
+    ${prevV?`<div class="prev"><small>${prevV.v}절 · ${esc(prevBy?prevBy.n:"")}님이 쓰셨어요</small>${esc(prevV.t)}</div>`:`<div class="prev"><small>첫 구절이에요</small>이 릴레이의 시작을 열어 주세요.</div>`}
+    <div class="target" id="tg"></div>
+    <textarea id="ta" placeholder="위 구절을 그대로 따라 써 보세요" autocomplete="off" autocapitalize="off" spellcheck="false"></textarea>
+    <div class="row"><div class="meter" id="mt">0%</div><button class="btn ghost" id="cx">닫기</button><button class="btn go" id="ok" disabled>이어쓰기 완료</button></div>`);
+  const target=s.next.t, nt=norm(target);
+  const tg=$("tg"), ta=$("ta"), ok=$("ok"), mt=$("mt");
+  function upd(){
+    const nv=norm(ta.value); let k=0; while(k<nv.length&&k<nt.length&&nv[k]===nt[k])k++;
+    const bad=k<nv.length;
+    // map k normalized chars back to target index
+    let i=0,c=0; while(i<target.length&&c<k){ if(norm(target[i]))c++; i++; }
+    tg.innerHTML=`<span class="vn">${s.next.v}절</span><span class="ok">${esc(target.slice(0,i))}</span><span class="rest">${esc(target.slice(i))}</span>`;
+    ta.classList.toggle("bad",bad);
+    mt.textContent=bad?"글자가 달라요. 다시 확인해 주세요":`${Math.round(k/nt.length*100)}%`;
+    ok.disabled=!(nv===nt);
+  }
+  ta.oninput=upd; upd();
+  $("cx").onclick=closeSheet;
+  ok.onclick=()=>submitVerse(s.c,s.next,ok);
+}
+// ---------- group / mine ----------
+let group = null; // {code,name}
+const groupKey = () => group ? group.code : "plaza";
+const colPath = () => group ? `groups/${group.code}/verses` : "verses";
+function mineList(){ return ls("br_mine_"+groupKey())||[]; }
+function addMine(rec){ const l=mineList(); l.push({camp:rec.camp,v:rec.v,at:rec.at}); ls("br_mine_"+groupKey(),l.slice(-200)); }
+function loadLocal(){ done.clear(); const l=ls("br_local_"+groupKey())||{}; for(const k in l) done.set(k,l[k]); }
+function saveLocal(){ const o={}; done.forEach((v,k)=>o[k]=v); ls("br_local_"+groupKey(),o); }
+function verseOf(camp,v){ const c=CAMPAIGNS.find(x=>x.id===camp); return c&&{c,verse:c.verses.find(x=>x.v===v)}; }
+function renderGroup(){ const g=$("grp"); if(group){ g.textContent="⛪ "+group.name; g.style.display="inline-block"; } else g.style.display="none"; }
+
+async function submitVerse(c,v,btn){
+  btn.disabled=true; btn.textContent="올리는 중…";
+  const key=c.id+"-"+v.v;
+  const rec={n:me.n,c:me.c,at:Date.now(),camp:c.id,v:v.v};
+  if(shared&&db){
+    try{
+      const ref=db.collection(colPath()).doc(key);
+      const snap=await ref.get();
+      if(docExists(snap)){ applyDoc(key,docData(snap)); toast("앗, 방금 다른 분이 먼저 이어 썼어요.<br>다음 구절로 넘어갈게요"); setTimeout(openWrite,1400); return; }
+      await ref.set(rec);
+    }catch(e){ console.log("db write failed",e); toast("저장하지 못했어요.<br><span style='font-size:13px'>인터넷 연결을 확인하고 다시 시도해 주세요</span>"); btn.disabled=false; btn.textContent="이어쓰기 완료"; return; }
+  }
+  done.set(key,rec); if(!shared) saveLocal(); addMine(rec);
+  me.w={k:key,t:Date.now()}; dirty();
+  closeSheet(); renderTop();
+  sparkle(LECTERN.x,LECTERN.y-30,60);
+  pushFeed(`✍️ ${me.n}님이 ${c.title.split(" ")[0]} ${v.v}절을 이어 썼어요`);
+  const finished = c.verses.every(x=>done.has(c.id+"-"+x.v));
+  if(finished){ toast(`🎉 ${esc(c.title)} 릴레이 완주!`); setTimeout(()=>openCert(c.id),1500); }
+  else { toast(`${esc(c.title.split(" ")[0])} ${v.v}절, 잘 이어졌어요 ✨`); setTimeout(()=>openCard(c.id,v.v,rec.n),1300); }
+}
+let toastT; function toast(h){const t=$("toast");t.innerHTML=h;t.classList.add("show");clearTimeout(toastT);toastT=setTimeout(()=>t.classList.remove("show"),2400);}
+function pushFeed(txt){const f=$("feed");const d=document.createElement("div");d.textContent=txt;f.prepend(d);while(f.children.length>4)f.lastChild.remove();setTimeout(()=>d.remove(),9000);}
+
+// ---------- menu ----------
+function openMenu(){
+  const doneCamps=CAMPAIGNS.filter(c=>c.verses.every(x=>done.has(c.id+"-"+x.v)));
+  openSheet(`<h2>메뉴</h2><div class="sub">${group?`지금 <b>${esc(group.name)}</b> 방에 있어요 · 코드 ${esc(group.code)}`:"지금 모두의 광장에 있어요"}</div>
+   <div class="menu">
+     <button class="mi" id="mSpace"><span>🗺️</span><div><b>예배·기도 공간 이동</b><small>기도실 · 새벽기도 · 수요예배 · 주일예배</small></div></button>
+     <button class="mi" id="mCard"><span>🖼️</span><div><b>오늘의 말씀 카드</b><small>내가 쓴 구절, 또는 오늘의 구절을 카드로</small></div></button>
+     <button class="mi" id="mCert"><span>📜</span><div><b>완주 인증서</b><small>${doneCamps.length?doneCamps.map(c=>esc(c.title)).join(", ")+" 완주":"릴레이를 완주하면 받을 수 있어요"}</small></div></button>
+     <button class="mi" id="mNew"><span>⛪</span><div><b>우리 교회·모임 방 만들기</b><small>구역, 청년부, 주일학교끼리 따로 릴레이</small></div></button>
+     <button class="mi" id="mJoin"><span>🔑</span><div><b>방 코드로 입장</b><small>전달받은 코드 입력</small></div></button>
+     ${group?`<button class="mi" id="mShare"><span>📨</span><div><b>방 코드 복사하기</b><small>${esc(group.code)}</small></div></button><button class="mi" id="mPlaza"><span>🌿</span><div><b>모두의 광장으로 돌아가기</b><small>전체 릴레이</small></div></button>`:""}
+     <button class="mi" id="mName"><span>🐑</span><div><b>내 이름·색 바꾸기</b><small>${esc(me.n)}</small></div></button>
+   </div>`);
+  $("mCard").onclick=()=>{ const l=mineList(); const m=l[l.length-1]; if(m) openCard(m.camp,m.v,me.n); else openDaily(); };
+  $("mCert").onclick=()=>{ if(doneCamps.length) openCertPicker(doneCamps); else certPreview(); };
+  $("mSpace").onclick=openSpaces; $("mNew").onclick=openNewGroup; $("mJoin").onclick=openJoin; $("mName").onclick=openName;
+  if(group){ $("mShare").onclick=()=>copyText(group.code,"방 코드를 복사했어요"); $("mPlaza").onclick=()=>{closeSheet();switchGroup(null);}; }
+}
+function copyText(t,msg){ try{ navigator.clipboard.writeText(t).then(()=>toast(msg),()=>toast("복사가 막혔어요. 코드: "+esc(t))); }catch(e){ toast("코드: "+esc(t)); } }
+function openNewGroup(){
+  openSheet(`<h2>우리 교회·모임 방 만들기</h2><div class="sub">우리끼리만 이어 쓰는 릴레이 방이 생겨요. 만든 뒤 방 코드를 단톡방에 공유하세요.</div>
+   <div class="namebox"><input id="gn" maxlength="20" placeholder="예: 새벽교회 청년부"><button class="btn go" id="gOk">만들기</button></div>`);
+  $("gOk").onclick=async()=>{
+    const name=$("gn").value.trim(); if(!name){ $("gn").focus(); return; }
+    const code=Math.random().toString(36).slice(2,8);
+    if(shared&&db){ try{ await db.collection("groups").doc(code).set({name,at:Date.now(),by:me.n}); }catch(e){ console.log(e); } }
+    ls("br_gname_"+code,name);
+    closeSheet(); await switchGroup({code,name});
+    openSheet(`<div class="done"><div class="big">⛪</div><h2>${esc(name)} 방이 열렸어요</h2>
+      <div class="sub" style="margin-top:6px">이 페이지를 함께 열고 아래 코드로 입장하면 같은 방에서 만나요</div>
+      <div class="code">${esc(code)}</div><button class="btn go" id="cp">코드 복사</button></div>`);
+    $("cp").onclick=()=>copyText(code,"방 코드를 복사했어요");
+  };
+}
+function openJoin(){
+  openSheet(`<h2>방 코드로 입장</h2><div class="sub">모임에서 받은 6자리 코드를 입력하세요</div>
+   <div class="namebox"><input id="jc" maxlength="12" placeholder="예: k3x9ab" autocapitalize="off"><button class="btn go" id="jOk">입장</button></div>`);
+  $("jOk").onclick=async()=>{
+    const code=$("jc").value.trim().toLowerCase().replace(/[^a-z0-9]/g,""); if(code.length<4){ $("jc").focus(); return; }
+    let name=ls("br_gname_"+code)||null;
+    if(shared&&db){ try{ const s=await db.collection("groups").doc(code).get(); if(docExists(s)) name=String(docData(s).name||"").slice(0,20)||name; }catch(e){} }
+    closeSheet(); await switchGroup({code,name:name||("모임 "+code)});
+    toast(`⛪ ${esc(name||("모임 "+code))} 방에 들어왔어요`);
+  };
+}
+async function switchGroup(g){
+  group=g; ls("br_group",g);
+  try{ location.hash = g ? "g-"+g.code : ""; }catch(e){}
+  renderGroup(); peers.clear();
+  if(shared) { done.clear(); subscribe(); subscribePrayers(); } else { loadLocal(); loadPrayersLocal(); }
+  svcIdx=-1; tickService(true);
+  renderTop(); await attachRoom();
+}
+
+// ---------- cards (canvas → image) ----------
+function wrapText(c,text,maxW){
+  const words=text.split(" "); const lines=[]; let cur="";
+  for(const w of words){ const t=cur?cur+" "+w:w; if(c.measureText(t).width>maxW&&cur){ lines.push(cur); cur=w; } else cur=t; }
+  if(cur) lines.push(cur); return lines;
+}
+async function fontsReady(){ try{ await Promise.all([document.fonts.load('40px "Gowun Batang"'),document.fonts.load('bold 40px "Gowun Batang"'),document.fonts.load('30px "Gowun Dodum"')]); }catch(e){} }
+function paperBG(c,w,h,dark){
+  const g=c.createLinearGradient(0,0,0,h);
+  if(dark){ g.addColorStop(0,"#2b2340"); g.addColorStop(1,"#1d1830"); } else { g.addColorStop(0,"#fbf6ec"); g.addColorStop(1,"#f1e6cf"); }
+  c.fillStyle=g; c.fillRect(0,0,w,h);
+  for(let i=0;i<70;i++){ c.fillStyle=dark?`rgba(246,216,146,${Math.random()*.35})`:`rgba(201,143,42,${Math.random()*.08})`; c.beginPath(); c.arc(Math.random()*w,Math.random()*h,Math.random()*3+1,0,7); c.fill(); }
+}
+function miniLamb(c,x,y,s,col){
+  c.save(); c.translate(x,y); c.scale(s,s);
+  c.fillStyle=col; c.beginPath(); c.moveTo(-14,8); c.quadraticCurveTo(-16,-14,0,-14); c.quadraticCurveTo(16,-14,14,8); c.closePath(); c.fill();
+  c.fillStyle="#f6d7bf"; c.beginPath(); c.arc(0,-30,16,0,7); c.fill();
+  c.fillStyle="#5a3a28"; c.beginPath(); c.arc(0,-33,16.5,Math.PI*1.02,Math.PI*1.98); c.fill();
+  c.fillStyle="#2b2340"; c.beginPath(); c.arc(-5.5,-29,1.8,0,7); c.arc(5.5,-29,1.8,0,7); c.fill();
+  c.fillStyle="#f4a6a6aa"; c.beginPath(); c.arc(-9,-24,2.6,0,7); c.arc(9,-24,2.6,0,7); c.fill();
+  c.restore();
+}
+function dateStr(t){ const d=new Date(t||Date.now()); return `${d.getFullYear()}. ${d.getMonth()+1}. ${d.getDate()}.`; }
+async function verseCanvas(campId,vn,who,label){
+  await fontsReady();
+  const vv=verseOf(campId,vn); if(!vv) return null;
+  const W2=1080,H2=1350, cvs=document.createElement("canvas"); cvs.width=W2; cvs.height=H2; const c=cvs.getContext("2d");
+  paperBG(c,W2,H2,true);
+  const lg=c.createRadialGradient(W2/2,0,40,W2/2,300,900); lg.addColorStop(0,"#fff3c855"); lg.addColorStop(1,"#fff3c800"); c.fillStyle=lg; c.fillRect(0,0,W2,H2);
+  c.strokeStyle="#e8b65a88"; c.lineWidth=3; c.strokeRect(54,54,W2-108,H2-108);
+  c.strokeStyle="#e8b65a44"; c.lineWidth=1.5; c.strokeRect(70,70,W2-140,H2-140);
+  c.textAlign="center"; c.fillStyle="#f6d892"; c.font='30px "Gowun Dodum"'; c.fillText(label,W2/2,170);
+  c.font='bold 56px "Gowun Batang"'; c.fillStyle="#fbf6ec";
+  const lines=wrapText(c,vv.verse.t,W2-240); const lh=92; let y=H2/2-(lines.length*lh)/2+30;
+  c.font='120px "Gowun Batang"'; c.fillStyle="#e8b65a55"; c.fillText("“",W2/2,y-70);
+  c.font='bold 56px "Gowun Batang"'; c.fillStyle="#fbf6ec";
+  for(const l of lines){ c.fillText(l,W2/2,y); y+=lh; }
+  c.fillStyle="#f6d892"; c.font='38px "Gowun Batang"'; c.fillText(`${vv.c.title.split(" ")[0]} ${vv.c.id.replace(/\D/g,"")}:${vn}`,W2/2,y+40);
+  miniLamb(c,W2/2-10,H2-250,2.4,me.c);
+  c.fillStyle="#efe7d6"; c.font='30px "Gowun Dodum"';
+  if(who) c.fillText(`${who} 님이 이어 쓴 구절`,W2/2,H2-170);
+  c.fillStyle="#a99fbf"; c.font='26px "Gowun Dodum"'; c.fillText(`말씀정원 · 바이블 릴레이${group?" · "+group.name:""} · ${dateStr()}`,W2/2,H2-118);
+  return cvs;
+}
+function showImage(cvs,title,sub,extra){
+  const url=cvs.toDataURL("image/png");
+  openSheet(`<h2>${title}</h2><div class="sub">${sub}</div><img class="cardimg" src="${url}" alt="${esc(title)}">
+   <div class="sub" style="text-align:center;margin-top:8px">📱 이미지를 길게 눌러 저장하거나 공유하세요</div>${extra||""}
+   <div class="row"><button class="btn ghost" id="cx2" style="flex:1">닫기</button></div>`);
+  $("cx2").onclick=closeSheet;
+}
+async function openCard(campId,vn,who){
+  const vv=verseOf(campId,vn); if(!vv) return;
+  const cvs=await verseCanvas(campId,vn,who,"오늘 내가 이어 쓴 말씀"); if(!cvs) return;
+  const ref=`${vv.c.title.split(" ")[0]} ${vv.c.id.replace(/\D/g,"")}:${vn}`;
+  showImage(cvs,"오늘의 말씀 카드",`${esc(ref)} · 개역한글`,`<div class="row"><button class="btn go" id="cpv" style="flex:1">구절 텍스트 복사</button></div>`);
+  $("cpv").onclick=()=>copyText(`"${vv.verse.t}" (${ref}, 개역한글)\n— 말씀정원 바이블 릴레이에서 함께 이어 쓴 말씀`,"구절을 복사했어요");
+}
+async function openDaily(){
+  const all=[]; CAMPAIGNS.forEach(c=>c.verses.forEach(v=>all.push([c.id,v.v])));
+  const d=new Date(); const idx=(d.getFullYear()*372+d.getMonth()*31+d.getDate())%all.length;
+  const [cid,vn]=all[idx]; const vv=verseOf(cid,vn);
+  const cvs=await verseCanvas(cid,vn,null,"오늘의 말씀");
+  const ref=`${vv.c.title.split(" ")[0]} ${vv.c.id.replace(/\D/g,"")}:${vn}`;
+  showImage(cvs,"오늘의 말씀 카드",`아직 쓴 구절이 없어서 오늘의 구절을 골랐어요 · ${esc(ref)}`,`<div class="row"><button class="btn go" id="cpv" style="flex:1">구절 텍스트 복사</button></div>`);
+  $("cpv").onclick=()=>copyText(`"${vv.verse.t}" (${ref}, 개역한글)`,"구절을 복사했어요");
+}
+function openCertPicker(list){
+  if(list.length===1) return openCert(list[0].id);
+  openSheet(`<h2>완주 인증서</h2><div class="sub">어떤 릴레이의 인증서를 볼까요?</div><div class="menu">${list.map(c=>`<button class="mi" data-c="${c.id}"><span>📜</span><div><b>${esc(c.title)}</b><small>${c.verses.length}절 완주</small></div></button>`).join("")}</div>`);
+  body.querySelectorAll("[data-c]").forEach(b=>b.onclick=()=>openCert(b.dataset.c));
+}
+function certPreview(){
+  const s=campState();
+  openSheet(`<div class="done"><div class="big">📜</div><h2>아직 완주한 릴레이가 없어요</h2><div class="sub" style="margin-top:6px">${esc(s.c.title)} · ${s.count}/${s.c.verses.length}절 진행 중<br>마지막 절이 채워지는 순간, 함께한 모든 분의 이름이 인증서에 새겨져요</div></div>`);
+}
+async function openCert(campId){
+  await fontsReady();
+  const c0=CAMPAIGNS.find(c=>c.id===campId); if(!c0) return;
+  const recs=c0.verses.map(v=>done.get(c0.id+"-"+v.v)).filter(Boolean);
+  const names=[...new Set(recs.map(r=>r.n))];
+  const last=Math.max(...recs.map(r=>r.at||0),Date.now()*0)||Date.now();
+  const myCount=mineList().filter(m=>m.camp===campId).length;
+  const W2=1080,H2=1500, cvs=document.createElement("canvas"); cvs.width=W2; cvs.height=H2; const c=cvs.getContext("2d");
+  paperBG(c,W2,H2,false);
+  c.strokeStyle="#c98f2a"; c.lineWidth=6; c.strokeRect(50,50,W2-100,H2-100);
+  c.strokeStyle="#c98f2a77"; c.lineWidth=2; c.strokeRect(72,72,W2-144,H2-144);
+  for(const [x,y] of [[72,72],[W2-72,72],[72,H2-72],[W2-72,H2-72]]){ c.fillStyle="#e8b65a"; c.beginPath(); c.arc(x,y,12,0,7); c.fill(); }
+  c.textAlign="center";
+  c.fillStyle="#9a7a3a"; c.font='30px "Gowun Dodum"'; c.fillText("CERTIFICATE OF COMPLETION",W2/2,180);
+  c.fillStyle="#2b2340"; c.font='bold 78px "Gowun Batang"'; c.fillText("완주 인증서",W2/2,280);
+  c.fillStyle="#c98f2a"; c.fillRect(W2/2-60,316,120,4);
+  c.fillStyle="#2b2340"; c.font='bold 52px "Gowun Batang"'; c.fillText(c0.title,W2/2,420);
+  c.fillStyle="#5b5270"; c.font='32px "Gowun Batang"';
+  const intro=`${group?group.name+"의 ":""}${names.length}명이 한 절씩 손으로 이어 써서`;
+  c.fillText(intro,W2/2,500); c.fillText(`${c0.verses.length}절을 모두 완성했음을 기념합니다.`,W2/2,552);
+  // names
+  c.fillStyle="#2b2340"; c.font='30px "Gowun Dodum"';
+  const shown=names.slice(0,40); const nameLines=wrapText(c,shown.join(" · ")+(names.length>40?` 외 ${names.length-40}명`:""),W2-260);
+  let y=650; c.fillStyle="#9a7a3a"; c.font='26px "Gowun Dodum"'; c.fillText("함께한 사람들",W2/2,y); y+=56;
+  c.fillStyle="#2b2340"; c.font='30px "Gowun Dodum"';
+  for(const l of nameLines.slice(0,10)){ c.fillText(l,W2/2,y); y+=50; }
+  if(myCount){ c.fillStyle="#3f8a5c"; c.font='bold 32px "Gowun Batang"'; c.fillText(`${me.n} 님은 ${myCount}절을 이어 쓰셨어요`,W2/2,Math.max(y+60,960)); }
+  // seal
+  c.save(); c.translate(W2/2,1260); c.fillStyle="#b23a48"; c.beginPath(); for(let i=0;i<24;i++){const a=i/24*Math.PI*2, r=i%2?78:88; c.lineTo(Math.cos(a)*r,Math.sin(a)*r);} c.closePath(); c.fill();
+  c.strokeStyle="#fbf6ec"; c.lineWidth=3; c.beginPath(); c.arc(0,0,62,0,7); c.stroke();
+  c.fillStyle="#fbf6ec"; c.font='bold 30px "Gowun Batang"'; c.fillText("말씀",0,-4); c.fillText("정원",0,32); c.restore();
+  c.fillStyle="#5b5270"; c.font='28px "Gowun Dodum"'; c.fillText(`${dateStr(last)} · 말씀정원 바이블 릴레이 · 개역한글`,W2/2,H2-110);
+  showImage(cvs,"완주 인증서",`${esc(c0.title)} · ${names.length}명 참여`);
+}
+
+// ---------- shared: db ----------
+function docExists(s){ if(!s) return false; if(typeof s.exists==="function") return s.exists(); if("exists" in s) return !!s.exists; return !!docData(s); }
+function docData(s){ if(!s) return null; if(typeof s.data==="function") return s.data(); if("data" in s) return s.data; return s; }
+function applyDoc(id,d){ if(!d||!id) return; done.set(id,{n:String(d.n||"누군가").slice(0,16),c:d.c,at:+d.at||0}); }
+let unsub=null, subGen=0;
+function subscribe(){
+  if(typeof unsub==="function"){ try{unsub();}catch(e){} } unsub=null;
+  const gen=++subGen; let first=true;
+  try{
+    unsub=db.collection(colPath()).onSnapshot(snap=>{
+      if(gen!==subGen) return;
+      const docs=snap&&snap.docs?snap.docs:(Array.isArray(snap)?snap:[]);
+      const before=done.size; const seen=new Map();
+      for(const d of docs){ const id=d.id||(d.ref&&d.ref.id); const data=docData(d); if(id&&data) seen.set(id,data); }
+      done.clear(); seen.forEach((v,k)=>applyDoc(k,v)); renderTop();
+      if(!first && done.size>before) sparkle(LECTERN.x,LECTERN.y-30,24);
+      first=false;
+    });
+  }catch(e){ console.log("snapshot failed",e); }
+}
+async function initDB(){
+  try{ db=await claude.use("db"); }catch(e){ db=null; }
+  if(!db){ $("mode").style.display="block"; $("mode").textContent="혼자 모드 · 진행은 이 기기에만 저장돼요"; renderTop(); return; }
+  shared=true; done.clear(); renderTop(); subscribe(); subscribePrayers();
+  if(group){ try{ const s=await db.collection("groups").doc(group.code).get(); if(docExists(s)&&docData(s).name){ group.name=String(docData(s).name).slice(0,20); ls("br_group",group); renderGroup(); } }catch(e){} }
+}
+// ---------- shared: room ----------
+let pendingPresence=false, lastSent=0, lobby=null, groupRoom=null, roomGen=0;
+function dirty(){ pendingPresence=true; }
+setInterval(()=>{
+  if(!room||!pendingPresence) return;
+  const now=Date.now(); if(now-lastSent<350) return;
+  pendingPresence=false; lastSent=now;
+  try{ room.presence({n:me.n,c:me.c,x:Math.round(player.tx),y:Math.round(player.ty),px:Math.round(player.x),py:Math.round(player.y),s:player.sit,e:me.e||null,w:me.w||null}); }catch(e){}
+},80);
+setInterval(()=>{ if(room){pendingPresence=true;} },25000);
+function handlePeers(all){
+  const list=Array.isArray(all)?all:Object.entries(all||{}).map(([id,v])=>Object.assign({id},v));
+  const alive=new Set();
+  for(const p of list){
+    const st=p.presence||p.state||p.data||p;
+    const mine=p.you||p.self||p.isSelf||p.me;
+    if(mine||!st||typeof st.x!=="number") continue;
+    const id=String(p.id||p.peerId||p.key||p.clientId||st.n);
+    alive.add(id);
+    let q=peers.get(id);
+    if(!q){ q={x:st.px??st.x,y:st.py??st.y,walk:0,face:1,e:null,w:null}; peers.set(id,q); pushFeed(`🐑 ${String(st.n||"누군가").slice(0,12)}님이 들어오셨어요`); }
+    q.n=String(st.n||"순례자").slice(0,12); q.c=/^#[0-9a-f]{6}$/i.test(st.c)?st.c:"#e8b65a";
+    q.tx=clamp(+st.x||360,60,W-60); q.ty=clamp(+st.y||1000,120,H-30); q.s=!!st.s;
+    if(st.e&&st.e.t&&(!q.e||q.e.t!==st.e.t)){ q.e=st.e; if(Date.now()-st.e.t<6000) emote(q.x,q.y,String(st.e.k).slice(0,2)); }
+    if(st.w&&st.w.t&&(!q.w||q.w.t!==st.w.t)){ q.w=st.w; if(Date.now()-st.w.t<8000){ sparkle(LECTERN.x,LECTERN.y-30,40); const [cid,vv]=String(st.w.k).split("-"); const cc=CAMPAIGNS.find(c=>c.id===cid); if(cc) pushFeed(`✍️ ${q.n}님이 ${cc.title.split(" ")[0]} ${vv}절을 이어 썼어요`);} }
+  }
+  for(const id of [...peers.keys()]) if(!alive.has(id)) peers.delete(id);
+  $("online").textContent=`지금 ${peers.size+1}명 함께`;
+}
+async function attachRoom(){
+  if(!lobby) return;
+  const gen=++roomGen;
+  if(groupRoom){ try{ groupRoom.leave(); }catch(e){} groupRoom=null; }
+  peers.clear();
+  const rname = space==="relay" ? (group?"g-"+group.code:null) : "s-"+space+(group?"-"+group.code:"");
+  if(rname){
+    try{ lobby.presence({hidden:true}); }catch(e){}
+    try{ groupRoom=await lobby.join(rname); }catch(e){ groupRoom=null; }
+    if(gen!==roomGen) return;
+    room=groupRoom||lobby;
+  } else room=lobby;
+  try{ room.onPeers(all=>{ if(gen===roomGen) handlePeers(all); }); }catch(e){}
+  $("online").textContent="지금 1명 함께"; dirty();
+}
+async function initRoom(){
+  try{ lobby=await claude.use("room"); }catch(e){ lobby=null; }
+  if(!lobby){ $("online").textContent="나 혼자"; $("dot").classList.add("off"); return; }
+  await attachRoom();
+}
+
+// ================= 예배·기도 공간 =================
+const WP = {"psa1":{"ref":"시편 1편","vs":[{"v":1,"t":"복 있는 사람은 악인의 꾀를 좇지 아니하며 죄인의 길에 서지 아니하며 오만한 자의 자리에 앉지 아니하고"},{"v":2,"t":"오직 여호와의 율법을 즐거워하여 그 율법을 주야로 묵상하는 자로다"},{"v":3,"t":"저는 시냇가에 심은 나무가 시절을 좇아 과실을 맺으며 그 잎사귀가 마르지 아니함 같으니 그 행사가 다 형통하리로다"},{"v":4,"t":"악인은 그렇지 않음이여 오직 바람에 나는 겨와 같도다"},{"v":5,"t":"그러므로 악인이 심판을 견디지 못하며 죄인이 의인의 회중에 들지 못하리로다"},{"v":6,"t":"대저 의인의 길은 여호와께서 인정하시나 악인의 길은 망하리로다"}]},"psa23":{"ref":"시편 23편","vs":[{"v":1,"t":"여호와는 나의 목자시니 내가 부족함이 없으리로다"},{"v":2,"t":"그가 나를 푸른 초장에 누이시며 쉴만한 물 가으로 인도하시는도다"},{"v":3,"t":"내 영혼을 소생시키시고 자기 이름을 위하여 의의 길로 인도하시는도다"},{"v":4,"t":"내가 사망의 음침한 골짜기로 다닐지라도 해를 두려워하지 않을 것은 주께서 나와 함께 하심이라 주의 지팡이와 막대기가 나를 안위하시나이다"},{"v":5,"t":"주께서 내 원수의 목전에서 내게 상을 베푸시고 기름으로 내 머리에 바르셨으니 내 잔이 넘치나이다"},{"v":6,"t":"나의 평생에 선하심과 인자하심이 정녕 나를 따르리니 내가 여호와의 집에 영원히 거하리로다"}]},"psa46":{"ref":"시편 46편","vs":[{"v":1,"t":"하나님은 우리의 피난처시요 힘이시니 환난 중에 만날 큰 도움이시라"},{"v":2,"t":"그러므로 땅이 변하든지 산이 흔들려 바다 가운데 빠지든지"},{"v":3,"t":"바닷물이 흉용하고 뛰놀든지 그것이 넘침으로 산이 요동할지라도 우리는 두려워 아니하리로다(셀라)"},{"v":4,"t":"한 시내가 있어 나뉘어 흘러 하나님의 성 곧 지극히 높으신 자의 장막의 성소를 기쁘게 하도다"},{"v":5,"t":"왕의 딸이 궁중에서 모든 영화를 누리니 그 옷은 금으로 수 놓았도다\n하나님이 그 성중에 거하시매 그 성이 요동치 아니할 것이라 새벽에 하나님이 도우시리로다"},{"v":6,"t":"이방이 훤화하며 왕국이 동하였더니 저가 소리를 발하시매 땅이 녹았도다"},{"v":7,"t":"만군의 여호와께서 우리와 함께 하시니 야곱의 하나님은 우리의 피난처시로다"},{"v":8,"t":"와서 여호와의 행적을 볼지어다 땅을 황무케 하셨도다"},{"v":9,"t":"저가 땅끝까지 전쟁을 쉬게 하심이여 활을 꺾고 창을 끊으며 수레를 불사르시는도다"},{"v":10,"t":"이르시기를 너희는 가만히 있어 내가 하나님 됨을 알지어다 내가 열방과 세계 중에서 높임을 받으리라 하시도다"},{"v":11,"t":"만군의 여호와께서 우리와 함께 하시리니 야곱의 하나님은 우리의 피난처시로다"}]},"psa91":{"ref":"시편 91편","vs":[{"v":1,"t":"지존자의 은밀한 곳에 거하는 자는 전능하신 자의 그늘 아래 거하리로다"},{"v":2,"t":"내가 여호와를 가리켜 말하기를 저는 나의 피난처요 나의 요새요 나의 의뢰하는 하나님이라 하리니"},{"v":3,"t":"이는 저가 너를 새 사냥꾼의 올무에서와 극한 염병에서 건지실 것임이로다"},{"v":4,"t":"저가 너를 그 깃으로 덮으시리니 네가 그 날개 아래 피하리로다 그의 진실함은 방패와 손 방패가 되나니"},{"v":5,"t":"너는 밤에 놀램과 낮에 흐르는 살과"},{"v":6,"t":"흑암 중에 행하는 염병과 백주에 황폐케 하는 파멸을 두려워 아니하리로다"},{"v":7,"t":"천 인이 네 곁에서, 만 인이 네 우편에서 엎드러지나 이 재앙이 네게 가까이 못하리로다"},{"v":8,"t":"오직 너는 목도하리니 악인의 보응이 네게 보이리로다"},{"v":9,"t":"네가 말하기를 여호와는 나의 피난처시라 하고 지존자로 거처를 삼았으므로"},{"v":10,"t":"화가 네게 미치지 못하며 재앙이 네 장막에 가까이 오지 못하리니"},{"v":11,"t":"저가 너를 위하여 그 사자들을 명하사 네 모든 길에 너를 지키게 하심이라"},{"v":12,"t":"저희가 그 손으로 너를 붙들어 발이 돌에 부딪히지 않게 하리로다"},{"v":13,"t":"네가 사자와 독사를 밟으며 젊은 사자와 뱀을 발로 누르리로다"},{"v":14,"t":"하나님이 가라사대 저가 나를 사랑한즉 내가 저를 건지리라 저가 내 이름을 안즉 내가 저를 높이리라"},{"v":15,"t":"저가 내게 간구하리니 내가 응답하리라 저희 환난 때에 내가 저와 함께 하여 저를 건지고 영화롭게 하리라"},{"v":16,"t":"내가 장수함으로 저를 만족케 하며 나의 구원으로 보이리라 하시도다"}]},"psa100":{"ref":"시편 100편","vs":[{"v":1,"t":"온 땅이여 여호와께 즐거이 부를지어다"},{"v":2,"t":"기쁨으로 여호와를 섬기며 노래하면서 그 앞에 나아갈지어다"},{"v":3,"t":"여호와가 우리 하나님이신 줄 너희는 알지어다 그는 우리를 지으신 자시요 우리는 그의 것이니 그의 백성이요 그의 기르시는 양이로다"},{"v":4,"t":"감사함으로 그 문에 들어가며 찬송함으로 그 궁정에 들어가서 그에게 감사하며 그 이름을 송축할지어다"},{"v":5,"t":"대저 여호와는 선하시니 그 인자하심이 영원하고 그 성실하심이 대대로 미치리로다"}]},"psa121":{"ref":"시편 121편","vs":[{"v":1,"t":"내가 산을 향하여 눈을 들리라 나의 도움이 어디서 올꼬"},{"v":2,"t":"나의 도움이 천지를 지으신 여호와에게서로다"},{"v":3,"t":"여호와께서 너로 실족지 않게 하시며 너를 지키시는 자가 졸지 아니하시리로다"},{"v":4,"t":"이스라엘을 지키시는 자는 졸지도 아니하고 주무시지도 아니하시리로다"},{"v":5,"t":"여호와는 너를 지키시는 자라 여호와께서 네 우편에서 네 그늘이 되시나니"},{"v":6,"t":"낮의 해가 너를 상치 아니하며 밤의 달도 너를 해치 아니하리로다"},{"v":7,"t":"여호와께서 너를 지켜 모든 환난을 면케 하시며 또 네 영혼을 지키시리로다"},{"v":8,"t":"여호와께서 너의 출입을 지금부터 영원까지 지키시리로다"}]},"psa130":{"ref":"시편 130편","vs":[{"v":1,"t":"여호와여 내가 깊은 데서 주께 부르짖었나이다"},{"v":2,"t":"주여 내 소리를 들으시며 나의 간구하는 소리에 귀를 기울이소서"},{"v":3,"t":"여호와여 주께서 죄악을 감찰하실진대 주여 누가 서리이까"},{"v":4,"t":"그러나 사유하심이 주께 있음은 주를 경외케 하심이니이다"},{"v":5,"t":"나 곧 내 영혼이 여호와를 기다리며 내가 그 말씀을 바라는도다"},{"v":6,"t":"파수꾼이 아침을 기다림보다 내 영혼이 주를 더 기다리나니 참으로 파수꾼의 아침을 기다림보다 더하도다"},{"v":7,"t":"이스라엘아 여호와를 바랄지어다 여호와께는 인자하심과 풍성한 구속이 있음이라"},{"v":8,"t":"저가 이스라엘을 그 모든 죄악에서 구속하시리로다"}]},"lord":{"ref":"마태복음 6:9-13","vs":[{"v":9,"t":"그러므로 너희는 이렇게 기도하라 하늘에 계신 우리 아버지여 이름이 거룩히 여김을 받으시오며"},{"v":10,"t":"나라이 임하옵시며 뜻이 하늘에서 이룬 것 같이 땅에서도 이루어지이다"},{"v":11,"t":"오늘날 우리에게 일용할 양식을 주옵시고"},{"v":12,"t":"우리가 우리에게 죄 지은 자를 사하여 준 것 같이 우리 죄를 사하여 주옵시고"},{"v":13,"t":"우리를 시험에 들게 하지 마옵시고 다만 악에서 구하옵소서 (나라와 권세와 영광이 아버지께 영원히 있사옵나이다 아멘)"}]},"mat5":{"ref":"마태복음 5:1-16","vs":[{"v":1,"t":"예수께서 무리를 보시고 산에 올라가 앉으시니 제자들이 나아온지라"},{"v":2,"t":"입을 열어 가르쳐 가라사대"},{"v":3,"t":"심령이 가난한 자는 복이 있나니 천국이 저희 것임이요"},{"v":4,"t":"애통하는 자는 복이 있나니 저희가 위로를 받을 것임이요"},{"v":5,"t":"온유한 자는 복이 있나니 저희가 땅을 기업으로 받을 것임이요"},{"v":6,"t":"의에 주리고 목마른 자는 복이 있나니 저희가 배부를 것임이요"},{"v":7,"t":"긍휼히 여기는 자는 복이 있나니 저희가 긍휼히 여김을 받을 것임이요"},{"v":8,"t":"마음이 청결한 자는 복이 있나니 저희가 하나님을 볼 것임이요"},{"v":9,"t":"화평케 하는 자는 복이 있나니 저희가 하나님의 아들이라 일컬음을 받을 것임이요"},{"v":10,"t":"의를 위하여 핍박을 받은 자는 복이 있나니 천국이 저희 것임이라"},{"v":11,"t":"나를 인하여 너희를 욕하고 핍박하고 거짓으로 너희를 거스려 모든 악한 말을 할 때에는 너희에게 복이 있나니"},{"v":12,"t":"기뻐하고 즐거워하라 하늘에서 너희의 상이 큼이라 너희 전에 있던 선지자들을 이같이 핍박하였느니라"},{"v":13,"t":"너희는 세상의 소금이니 소금이 만일 그 맛을 잃으면 무엇으로 짜게 하리요 후에는 아무 쓸데 없어 다만 밖에 버리워 사람에게 밟힐 뿐이니라"},{"v":14,"t":"너희는 세상의 빛이라 산 위에 있는 동네가 숨기우지 못할 것이요"},{"v":15,"t":"사람이 등불을 켜서 말 아래 두지 아니하고 등경 위에 두나니 이러므로 집안 모든 사람에게 비취느니라"},{"v":16,"t":"이같이 너희 빛을 사람 앞에 비취게 하여 저희로 너희 착한 행실을 보고 하늘에 계신 너희 아버지께 영광을 돌리게 하라"}]},"jhn15":{"ref":"요한복음 15:1-17","vs":[{"v":1,"t":"내가 참 포도나무요 내 아버지는 그 농부라"},{"v":2,"t":"무릇 내게 있어 과실을 맺지 아니하는 가지는 아버지께서 이를 제해 버리시고 무릇 과실을 맺는 가지는 더 과실을 맺게 하려 하여 이를 깨끗케 하시느니라"},{"v":3,"t":"너희는 내가 일러 준 말로 이미 깨끗하였으니"},{"v":4,"t":"내 안에 거하라 나도 너희 안에 거하리라 가지가 포도나무에 붙어 있지 아니하면 절로 과실을 맺을 수 없음 같이 너희도 내 안에 있지 아니하면 그러하리라"},{"v":5,"t":"나는 포도나무요 너희는 가지니 저가 내 안에, 내가 저 안에 있으면 이 사람은 과실을 많이 맺나니 나를 떠나서는 너희가 아무 것도 할 수 없음이라"},{"v":6,"t":"사람이 내 안에 거하지 아니하면 가지처럼 밖에 버리워 말라지나니 사람들이 이것을 모아다가 불에 던져 사르느니라"},{"v":7,"t":"너희가 내 안에 거하고 내 말이 너희 안에 거하면 무엇이든지 원하는 대로 구하라 그리하면 이루리라"},{"v":8,"t":"너희가 과실을 많이 맺으면 내 아버지께서 영광을 받으실 것이요 너희가 내 제자가 되리라"},{"v":9,"t":"아버지께서 나를 사랑하신 것 같이 나도 너희를 사랑하였으니 나의 사랑 안에 거하라"},{"v":10,"t":"내가 아버지의 계명을 지켜 그의 사랑 안에 거하는 것 같이 너희도 내 계명을 지키면 내 사랑 안에 거하리라"},{"v":11,"t":"내가 이것을 너희에게 이름은 내 기쁨이 너희 안에 있어 너희 기쁨을 충만하게 하려 함이니라"},{"v":12,"t":"내 계명은 곧 내가 너희를 사랑한 것 같이 너희도 서로 사랑하라 하는 이것이니라"},{"v":13,"t":"사람이 친구를 위하여 자기 목숨을 버리면 이에서 더 큰 사랑이 없나니"},{"v":14,"t":"너희가 나의 명하는 대로 행하면 곧 나의 친구라"},{"v":15,"t":"이제부터는 너희를 종이라 하지 아니하리니 종은 주인의 하는 것을 알지 못함이라 너희를 친구라 하였노니 내가 내 아버지께 들은 것을 다 너희에게 알게 하였음이니라"},{"v":16,"t":"너희가 나를 택한 것이 아니요 내가 너희를 택하여 세웠나니 이는 너희로 가서 과실을 맺게 하고 또 너희 과실이 항상 있게 하여 내 이름으로 아버지께 무엇을 구하든지 다 받게 하려 함이니라"},{"v":17,"t":"내가 이것을 너희에게 명함은 너희로 서로 사랑하게 하려 함이로라"}]},"rom8":{"ref":"로마서 8:28-39","vs":[{"v":28,"t":"우리가 알거니와 하나님을 사랑하는 자 곧 그 뜻대로 부르심을 입은 자들에게는 모든 것이 합력하여 선을 이루느니라"},{"v":29,"t":"하나님이 미리 아신 자들로 또한 그 아들의 형상을 본받게 하기 위하여 미리 정하셨으니 이는 그로 많은 형제 중에서 맏아들이 되게 하려 하심이니라"},{"v":30,"t":"또 미리 정하신 그들을 또한 부르시고 부르신 그들을 또한 의롭다 하시고 의롭다 하신 그들을 또한 영화롭게 하셨느니라"},{"v":31,"t":"그런즉 이 일에 대하여 우리가 무슨 말 하리요 만일 하나님이 우리를 위하시면 누가 우리를 대적하리요"},{"v":32,"t":"자기 아들을 아끼지 아니하시고 우리 모든 사람을 위하여 내어 주신 이가 어찌 그 아들과 함께 모든 것을 우리에게 은사로 주지 아니하시겠느뇨"},{"v":33,"t":"누가 능히 하나님의 택하신 자들을 송사하리요 의롭다 하신 이는 하나님이시니"},{"v":34,"t":"누가 정죄하리요 죽으실 뿐 아니라 다시 살아나신 이는 그리스도 예수시니 그는 하나님 우편에 계신 자요 우리를 위하여 간구하시는 자시니라"},{"v":35,"t":"누가 우리를 그리스도의 사랑에서 끊으리요 환난이나 곤고나 핍박이나 기근이나 적신이나 위험이나 칼이랴"},{"v":36,"t":"기록된 바 우리가 종일 주를 위하여 죽임을 당케 되며 도살할 양 같이 여김을 받았나이다 함과 같으니라"},{"v":37,"t":"그러나 이 모든 일에 우리를 사랑하시는 이로 말미암아 우리가 넉넉히 이기느니라"},{"v":38,"t":"내가 확신하노니 사망이나 생명이나 천사들이나 권세자들이나 현재 일이나 장래 일이나 능력이나"},{"v":39,"t":"높음이나 깊음이나 다른 아무 피조물이라도 우리를 우리 주 그리스도 예수 안에 있는 하나님의 사랑에서 끊을 수 없으리라"}]},"co13":{"ref":"고린도전서 13장","vs":[{"v":1,"t":"내가 사람의 방언과 천사의 말을 할지라도 사랑이 없으면 소리나는 구리와 울리는 꽹과리가 되고"},{"v":2,"t":"내가 예언하는 능이 있어 모든 비밀과 모든 지식을 알고 또 산을 옮길 만한 모든 믿음이 있을지라도 사랑이 없으면 내가 아무 것도 아니요"},{"v":3,"t":"내가 내게 있는 모든 것으로 구제하고 또 내 몸을 불사르게 내어 줄지라도 사랑이 없으면 내게 아무 유익이 없느니라"},{"v":4,"t":"사랑은 오래 참고 사랑은 온유하며 투기하는 자가 되지 아니하며 사랑은 자랑하지 아니하며 교만하지 아니하며"},{"v":5,"t":"무례히 행치 아니하며 자기의 유익을 구치 아니하며 성내지 아니하며 악한 것을 생각지 아니하며"},{"v":6,"t":"불의를 기뻐하지 아니하며 진리와 함께 기뻐하고"},{"v":7,"t":"모든 것을 참으며 모든 것을 믿으며 모든 것을 바라며 모든 것을 견디느니라"},{"v":8,"t":"사랑은 언제까지든지 떨어지지 아니하나 예언도 폐하고 방언도 그치고 지식도 폐하리라"},{"v":9,"t":"우리가 부분적으로 알고 부분적으로 예언하니"},{"v":10,"t":"온전한 것이 올 때에는 부분적으로 하던 것이 폐하리라"},{"v":11,"t":"내가 어렸을 때에는 말하는 것이 어린 아이와 같고 깨닫는 것이 어린 아이와 같고 생각하는 것이 어린 아이와 같다가 장성한 사람이 되어서는 어린 아이의 일을 버렸노라"},{"v":12,"t":"우리가 이제는 거울로 보는 것 같이 희미하나 그 때에는 얼굴과 얼굴을 대하여 볼 것이요 이제는 내가 부분적으로 아나 그 때에는 주께서 나를 아신 것 같이 내가 온전히 알리라"},{"v":13,"t":"그런즉 믿음, 소망, 사랑, 이 세가지는 항상 있을 것인데 그 중에 제일은 사랑이라"}]},"jn1":{"ref":"요한일서 1:9","vs":[{"v":9,"t":"만일 우리가 우리 죄를 자백하면 저는 미쁘시고 의로우사 우리 죄를 사하시며 모든 불의에서 우리를 깨끗케 하실 것이요"}]},"num6":{"ref":"민수기 6:24-26","vs":[{"v":24,"t":"여호와는 네게 복을 주시고 너를 지키시기를 원하며"},{"v":25,"t":"여호와는 그 얼굴로 네게 비취사 은혜 베푸시기를 원하며"},{"v":26,"t":"여호와는 그 얼굴을 네게로 향하여 드사 평강주시기를 원하노라 할지니라 하라"}]},"isa40":{"ref":"이사야 40:28-31","vs":[{"v":28,"t":"너는 알지 못하였느냐 듣지 못하였느냐 영원하신 하나님 여호와, 땅 끝까지 창조하신 자는 피곤치 아니하시며 곤비치 아니하시며 명철이 한이 없으시며"},{"v":29,"t":"피곤한 자에게는 능력을 주시며 무능한 자에게는 힘을 더하시나니"},{"v":30,"t":"소년이라도 피곤하며 곤비하며 장정이라도 넘어지며 자빠지되"},{"v":31,"t":"오직 여호와를 앙망하는 자는 새 힘을 얻으리니 독수리의 날개치며 올라감 같을 것이요 달음박질하여도 곤비치 아니하겠고 걸어가도 피곤치 아니하리로다"}]}};
+const SPACES = {
+  relay:{name:"말씀정원",icon:"📖",desc:"함께 이어 쓰는 성경 릴레이 · 24시간"},
+  prayer:{name:"기도실",icon:"🕯️",desc:"누구나 언제든 들어와 기도 · 24시간"},
+  dawn:{name:"새벽기도",icon:"🌅",desc:"매일 오전 5:00 – 6:00",sched:{days:[0,1,2,3,4,5,6],h:5,m:0,dur:60}},
+  wed:{name:"수요예배",icon:"🌙",desc:"매주 수요일 오후 7:30 – 8:30",sched:{days:[3],h:19,m:30,dur:60}},
+  sun:{name:"주일예배",icon:"⛪",desc:"매주 주일 오전 11:00 – 12:00",sched:{days:[0],h:11,m:0,dur:60}},
+};
+const PRE_MIN=20; // 시작 20분 전부터 입장
+let space = ls("br_space") || "relay"; if(!SPACES[space]) space="relay";
+let practice = null; // {sp,start}
+const KST=9*3600e3, DAY=86400e3;
+const DOW=["일","월","화","수","목","금","토"];
+function kstParts(t){ const d=new Date(t+KST); return {y:d.getUTCFullYear(),mo:d.getUTCMonth()+1,d:d.getUTCDate(),dow:d.getUTCDay(),h:d.getUTCHours(),mi:d.getUTCMinutes()}; }
+function fmtWhen(t){ const p=kstParts(t); const ap=p.h<12?"오전":"오후"; const hh=p.h%12||12; return `${p.mo}월 ${p.d}일(${DOW[p.dow]}) ${ap} ${hh}:${String(p.mi).padStart(2,"0")}`; }
+function fmtLeft(ms){ ms=Math.max(0,ms); const m=Math.ceil(ms/60e3); const d=Math.floor(m/1440), h=Math.floor(m%1440/60), mm=m%60; return (d?d+"일 ":"")+(h?h+"시간 ":"")+(d?"":mm+"분"); }
+function fmtMMSS(ms){ ms=Math.max(0,ms); const s=Math.ceil(ms/1000); return `${Math.floor(s/60)}:${String(s%60).padStart(2,"0")}`; }
+function schedState(sp){
+  const S=SPACES[sp]; if(!S.sched) return {phase:"always"};
+  if(practice&&practice.sp===sp) return {phase:"live",start:practice.start,end:practice.start+S.sched.dur*60e3,practice:true};
+  const s=S.sched, now=Date.now();
+  const k=new Date(now+KST); const base=Date.UTC(k.getUTCFullYear(),k.getUTCMonth(),k.getUTCDate())-KST;
+  let best=null;
+  for(let i=-1;i<=8&&!best;i++){ const day0=base+i*DAY; const dow=new Date(day0+KST).getUTCDay(); if(!s.days.includes(dow)) continue;
+    const st=day0+(s.h*60+s.m)*60e3, en=st+s.dur*60e3; if(now<en) best={start:st,end:en}; }
+  const phase = now>=best.start ? "live" : (now>=best.start-PRE_MIN*60e3 ? "pre" : "closed");
+  return {...best,phase};
+}
+function orderFor(sp,start){
+  const day=Math.floor((start+KST)/DAY), week=Math.floor(day/7);
+  if(sp==="dawn"){ const ps=["psa1","psa23","psa46","psa91","psa100","psa121","psa130"][day%7]; return [
+    {t:"마음 열기",m:5,k:"calm",x:"조용히 눈을 감고 천천히 숨을 쉬어 보세요. 새로운 하루를 주님께 맡겨 드리며 마음을 엽니다."},
+    {t:"말씀 봉독",m:10,k:"read",p:ps},
+    {t:"말씀 묵상",m:10,k:"q",qs:["오늘 말씀에서 마음에 남는 한 구절은 무엇인가요?","그 말씀이 오늘 나의 하루에 어떤 의미가 될까요?","오늘 하루, 말씀대로 살아낼 작은 한 가지는 무엇일까요?"]},
+    {t:"개인 기도",m:25,k:"pray",x:"자리에 앉아(🙏 버튼) 각자의 기도를 드립니다. 기도제목을 올리거나, 다른 분의 기도제목에 '함께 기도'를 눌러 주세요."},
+    {t:"함께 드리는 기도",m:5,k:"wall",x:"서로의 기도제목을 위해 함께 기도합니다."},
+    {t:"주기도",m:5,k:"read",p:"lord"} ]; }
+  if(sp==="wed"){ const ps=["jhn15","mat5","rom8","co13"][week%4]; return [
+    {t:"마음 모으기",m:5,k:"calm",x:"한 주의 한가운데, 바쁜 마음을 내려놓고 주님 앞에 머뭅니다."},
+    {t:"말씀 봉독",m:10,k:"read",p:ps},
+    {t:"말씀 묵상",m:15,k:"q",qs:["이번 주 나에게 주시는 말씀은 무엇인가요?","말씀 앞에서 돌아보게 되는 나의 모습은 어떤가요?","남은 한 주, 어떻게 살아가고 싶나요?"]},
+    {t:"중보기도",m:20,k:"wall",x:"나라와 교회, 이웃과 가정, 그리고 이 자리에 함께한 서로를 위해 기도합니다."},
+    {t:"주기도",m:5,k:"read",p:"lord"},
+    {t:"마침 말씀",m:5,k:"read",p:"isa40"} ]; }
+  const ps=["mat5","jhn15","rom8","co13"][week%4]; return [
+    {t:"예배로의 부름",m:5,k:"read",p:"psa100"},
+    {t:"고백의 기도",m:5,k:"read",p:"jn1",x:"지난 한 주를 돌아보며 조용히 마음을 고백합니다."},
+    {t:"말씀 봉독",m:10,k:"read",p:ps},
+    {t:"말씀 묵상",m:15,k:"q",qs:["오늘 말씀의 핵심은 무엇이라고 느끼나요?","이 말씀이 내 삶의 어느 부분을 비추나요?","이번 주 순종으로 옮길 한 걸음은 무엇인가요?"]},
+    {t:"기도와 헌신",m:15,k:"wall",x:"서로의 기도제목을 나누고 함께 기도합니다."},
+    {t:"주기도",m:5,k:"read",p:"lord"},
+    {t:"축복의 말씀",m:5,k:"read",p:"num6"} ];
+}
+function curStep(sp){
+  const st=schedState(sp); if(st.phase!=="live") return {st};
+  const ord=orderFor(sp,st.start); let el=(Date.now()-st.start)/60e3, acc=0;
+  for(let i=0;i<ord.length;i++){ if(el<acc+ord[i].m) return {st,ord,i,step:ord[i],left:(acc+ord[i].m-el)*60e3,prog:el/ord.reduce((a,b)=>a+b.m,0)}; acc+=ord[i].m; }
+  return {st,ord,i:ord.length-1,step:ord[ord.length-1],left:0,prog:1};
+}
+
+// ---------- 공간 이동 ----------
+function openSpaces(){
+  const rows=Object.entries(SPACES).map(([k,S])=>{
+    const st=schedState(k); let badge="";
+    if(st.phase==="always") badge=`<em class="b on">24시간</em>`;
+    else if(st.phase==="live") badge=`<em class="b live">● 진행 중</em>`;
+    else if(st.phase==="pre") badge=`<em class="b on">곧 시작 · ${fmtLeft(st.start-Date.now())} 후</em>`;
+    else badge=`<em class="b">다음 ${fmtWhen(st.start)}</em>`;
+    return `<button class="mi${k===space?" cur":""}" data-s="${k}"><span>${S.icon}</span><div><b>${S.name}${k===space?" · 지금 여기":""}</b><small>${S.desc}</small>${badge}</div></button>`;
+  }).join("");
+  openSheet(`<h2>공간 이동</h2><div class="sub">예배와 기도는 공간마다 따로 열려요${group?` · ⛪ ${esc(group.name)} 전용`:""}</div><div class="menu">${rows}</div>`);
+  body.querySelectorAll("[data-s]").forEach(b=>b.onclick=()=>{ closeSheet(); switchSpace(b.dataset.s); });
+}
+async function switchSpace(sp){
+  if(!SPACES[sp]) return;
+  if(practice&&practice.sp!==sp) practice=null;
+  space=sp; ls("br_space",sp); svcIdx=-1;
+  player.x=player.tx=360; player.y=player.ty=960; player.sit=false; setPray(false); camY=1e4;
+  peers.clear(); applySpaceLook(); if(people.get("me")) people.get("me").placed=false; R3.camInit=false; renderSpaceUI(); renderTop(); tickService(true);
+  const c=$("svc"); c.classList.toggle("min",sp==="prayer"); $("svX").textContent=sp==="prayer"?"펼치기":"접기";
+  const hint=$("hint"); hint.textContent = sp==="relay"?"바닥을 눌러 걸어보세요 · 빛나는 성경에 다가가면 이어 쓸 수 있어요":"바닥을 눌러 걷고 · 의자를 누르면 앉아 기도해요 · 제단을 누르면 기도제목"; hint.style.opacity=1; setTimeout(()=>hint.style.opacity=0,6000);
+  await attachRoom();
+  toast(`${SPACES[sp].icon} ${SPACES[sp].name}에 들어왔어요`);
+}
+function renderSpaceUI(){
+  $("spName").textContent=`${SPACES[space].icon} ${SPACES[space].name}`;
+  $("bWrite").innerHTML = space==="relay" ? "✍️ 이어쓰기" : "🕯️ 기도제목";
+  $("bar").style.display = space==="relay"||SPACES[space].sched ? "block":"none";
+}
+
+// ---------- 예배 진행 카드 ----------
+let svcIdx=-1, svcCollapsed=false;
+function passageHTML(key){ const P=WP[key]; if(!P) return ""; return `<div class="pref">${esc(P.ref)} · 개역한글</div>`+P.vs.map(v=>`<p><sup>${v.v}</sup>${esc(v.t)}</p>`).join(""); }
+function tickService(force){
+  const card=$("svc"), closed=$("closed");
+  if(space==="relay"){ card.style.display="none"; closed.style.display="none"; return; }
+  if(space==="prayer"){
+    closed.style.display="none"; card.style.display="block";
+    renderTop();
+    if(force||svcIdx!=="prayer"){ if(svcIdx!=="prayer"&&!force){} svcIdx="prayer"; $("svT").textContent="🕯️ 언제든 열려 있는 기도실"; $("svR").textContent="";
+      $("svB").innerHTML=`<p class="calm">들어와 자리에 앉아(🙏) 조용히 기도하세요. 앞쪽 제단의 촛불 하나하나가 누군가의 기도제목이에요. 제단을 누르면 기도제목을 나누고 함께 기도할 수 있어요.</p>${wallPreview(3)}`; bindWall(); }
+    return;
+  }
+  const c=curStep(space), st=c.st;
+  if(st.phase==="closed"){
+    card.style.display="none"; closed.style.display="flex";
+    $("clT").textContent=`${SPACES[space].icon} ${SPACES[space].name}`;
+    $("clW").textContent=`다음 예배 · ${fmtWhen(st.start)}`;
+    $("clL").textContent=`${fmtLeft(st.start-Date.now())} 후에 열려요 (시작 ${PRE_MIN}분 전 입장)`;
+    renderTop(); return;
+  }
+  closed.style.display="none"; card.style.display="block";
+  if(st.phase==="pre"){
+    if(force||svcIdx!=="pre"){ svcIdx="pre"; $("svT").textContent=`곧 ${SPACES[space].name}가 시작돼요`;
+      $("svB").innerHTML=`<p class="calm">편한 자리에 앉아(🙏) 마음을 준비해 주세요. 시간이 되면 순서가 자동으로 함께 진행돼요.</p>${orderListHTML(orderFor(space,st.start),-1)}`; }
+    $("svR").textContent=`${fmtMMSS(st.start-Date.now())} 후 시작`;
+    renderTop(); return;
+  }
+  const key=space+":"+st.start+":"+c.i;
+  if(force||svcIdx!==key){
+    const prevIdx=svcIdx; svcIdx=key;
+    const s=c.step; let h="";
+    if(s.x) h+=`<p class="calm">${esc(s.x)}</p>`;
+    if(s.k==="read") h+=passageHTML(s.p);
+    if(s.k==="q") h+=`<ol class="qs">${s.qs.map(q=>`<li>${esc(q)}</li>`).join("")}</ol><p class="calm">마음에 떠오른 것을 기도제목으로 남겨도 좋아요.</p>`;
+    if(s.k==="wall"||s.k==="pray") h+=wallPreview(s.k==="wall"?6:3);
+    if(c.i+1<c.ord.length) h+=`<div class="nextup">다음 순서 · ${esc(c.ord[c.i+1].t)}</div>`;
+    if(st.practice) h+=`<button class="btn ghost sm" id="pxEnd">연습 모드 끝내기</button>`;
+    $("svB").innerHTML=h; $("svB").scrollTop=0; bindWall();
+    if(st.practice&&$("pxEnd")) $("pxEnd").onclick=()=>{ practice=null; svcIdx=-1; tickService(true); renderTop(); };
+    if(prevIdx!==-1&&String(prevIdx).startsWith(space+":")) { pushFeed(`🔔 ${s.t} 순서예요`); sparkle(LECTERN.x,LECTERN.y-30,30); }
+  }
+  $("svT").textContent=`${c.i+1}/${c.ord.length} · ${c.step.t}${st.practice?" (연습)":""}`;
+  $("svR").textContent=`${fmtMMSS(c.left)} 남음`;
+  renderTop();
+}
+function orderListHTML(ord,cur){ return `<ol class="order">${ord.map((s,i)=>`<li class="${i===cur?"now":""}">${esc(s.t)} <small>${s.m}분</small></li>`).join("")}</ol>`; }
+setInterval(()=>tickService(false),1000);
+function renderWorshipTop(){
+  const S=SPACES[space];
+  $("campTitle").textContent=S.name;
+  if(space==="prayer"){ $("campProg").textContent=`· 기도제목 ${prayers.size}개 · 24시간`; return; }
+  const c=curStep(space), st=c.st;
+  if(st.phase==="live"){ $("campProg").textContent=`· ${st.practice?"연습 중":"● 진행 중"} · ${fmtWhen(st.start).split(" ").slice(2).join(" ")} 시작`; $("barFill").style.width=Math.min(100,c.prog*100)+"%"; }
+  else if(st.phase==="pre"){ $("campProg").textContent=`· 곧 시작`; $("barFill").style.width="0%"; }
+  else { $("campProg").textContent=`· 다음 ${fmtWhen(st.start)}`; $("barFill").style.width="0%"; }
+}
+
+// ---------- 기도제목 (prayer wall) ----------
+const prayers=new Map(); let unsubP=null, subPGen=0;
+const prayPath=()=> group?`groups/${group.code}/prayers`:"prayers";
+function loadPrayersLocal(){ prayers.clear(); const o=ls("br_prayers_"+groupKey())||{}; for(const k in o) prayers.set(k,o[k]); }
+function savePrayersLocal(){ const o={}; prayers.forEach((v,k)=>o[k]=v); ls("br_prayers_"+groupKey(),o); }
+function cleanP(d){ return {n:String(d.n||"누군가").slice(0,16),c:/^#[0-9a-f]{6}$/i.test(d.c)?d.c:"#e8b65a",t:String(d.t||"").slice(0,140),at:+d.at||0,amen:Math.max(0,+d.amen||0)}; }
+function subscribePrayers(){
+  if(typeof unsubP==="function"){ try{unsubP();}catch(e){} } unsubP=null;
+  const gen=++subPGen;
+  try{ unsubP=db.collection(prayPath()).onSnapshot(snap=>{
+    if(gen!==subPGen) return;
+    const docs=snap&&snap.docs?snap.docs:(Array.isArray(snap)?snap:[]);
+    prayers.clear(); for(const d of docs){ const id=d.id||(d.ref&&d.ref.id); const data=docData(d); if(id&&data&&data.t) prayers.set(id,cleanP(data)); }
+    if(sheet.classList.contains("show")&&$("pwList")) renderWallList();
+    if(space!=="relay") { const k=svcIdx; svcIdx=-1; tickService(true); }
+  }); }catch(e){ console.log("prayer snapshot failed",e); }
+}
+function sortedPrayers(by){ const a=[...prayers.entries()].map(([id,p])=>({id,...p})); a.sort(by==="amen"?(x,y)=>(y.amen-x.amen)||(y.at-x.at):(x,y)=>y.at-x.at); return a; }
+function wallPreview(n){
+  const list=sortedPrayers("recent").slice(0,n);
+  return `<div class="pw">${list.length?list.map(p=>prayItem(p)).join(""):`<div class="calm">아직 올라온 기도제목이 없어요. 첫 기도제목을 나눠 주세요.</div>`}</div><button class="btn go sm" data-act="wall">🕯️ 기도제목 ${prayers.size?"모두 보기 · ":""}올리기</button>`;
+}
+function prayItem(p){
+  const prayed=(ls("br_prayed")||{})[p.id];
+  return `<div class="pi"><div class="pt">${esc(p.t)}</div><div class="pm"><span><i style="background:${p.c}"></i>${esc(p.n)} · ${ago(p.at)}</span><button class="amen${prayed?" on":""}" data-pray="${p.id}">🙏 함께 기도 ${p.amen||""}</button></div></div>`;
+}
+function ago(t){ const m=Math.floor((Date.now()-t)/60e3); if(m<1) return "방금"; if(m<60) return m+"분 전"; const h=Math.floor(m/60); if(h<24) return h+"시간 전"; return Math.floor(h/24)+"일 전"; }
+function bindWall(root){
+  (root||document).querySelectorAll("[data-pray]").forEach(b=>b.onclick=()=>prayFor(b.dataset.pray));
+  (root||document).querySelectorAll("[data-act=wall]").forEach(b=>b.onclick=()=>openPrayerWall());
+}
+function openPrayerWall(){
+  openSheet(`<h2>🕯️ 기도제목</h2><div class="sub">함께 기도하고 싶은 제목을 나눠 주세요 · 실명이나 연락처, 다른 사람의 개인적인 사정은 적지 말아 주세요</div>
+   <textarea id="pwT" maxlength="140" placeholder="예: 다음 주 면접을 앞두고 있어요. 평안한 마음을 위해 기도해 주세요" style="min-height:76px;font-size:15px"></textarea>
+   <div class="row"><div class="meter" id="pwC">0/140</div><button class="btn go" id="pwOk">기도제목 올리기</button></div>
+   <div class="tabs"><button class="on" data-sort="recent">최근</button><button data-sort="amen">함께 기도 많은 순</button></div>
+   <div class="pw" id="pwList"></div>`);
+  $("pwT").oninput=()=>{$("pwC").textContent=$("pwT").value.length+"/140";};
+  $("pwOk").onclick=postPrayer;
+  body.querySelectorAll("[data-sort]").forEach(b=>b.onclick=()=>{ body.querySelectorAll("[data-sort]").forEach(x=>x.classList.toggle("on",x===b)); wallSort=b.dataset.sort; renderWallList(); });
+  renderWallList();
+}
+let wallSort="recent";
+function renderWallList(){
+  const el=$("pwList"); if(!el) return;
+  const mine=ls("br_myprayers")||{};
+  const list=sortedPrayers(wallSort);
+  el.innerHTML=list.length?list.slice(0,60).map(p=>prayItem(p)+(mine[p.id]?`<button class="del" data-del="${p.id}">내 기도제목 내리기</button>`:"")).join(""):`<div class="calm" style="padding:10px 0">아직 기도제목이 없어요.</div>`;
+  bindWall(el);
+  el.querySelectorAll("[data-del]").forEach(b=>b.onclick=()=>delPrayer(b.dataset.del));
+}
+async function postPrayer(){
+  const t=$("pwT").value.trim(); if(t.length<2){ $("pwT").focus(); return; }
+  const id=Date.now().toString(36)+Math.random().toString(36).slice(2,6);
+  const rec={n:me.n,c:me.c,t:t.slice(0,140),at:Date.now(),amen:0};
+  $("pwOk").disabled=true;
+  if(shared&&db){ try{ await db.collection(prayPath()).doc(id).set(rec); }catch(e){ toast("저장하지 못했어요.<br><span style='font-size:13px'>인터넷 연결을 확인하고 다시 시도해 주세요</span>"); $("pwOk").disabled=false; return; } }
+  prayers.set(id,rec); if(!shared) savePrayersLocal();
+  const mine=ls("br_myprayers")||{}; mine[id]=1; ls("br_myprayers",mine);
+  $("pwT").value=""; $("pwOk").disabled=false; $("pwC").textContent="0/140";
+  renderWallList(); svcIdx=-1; tickService(true);
+  sparkle(LECTERN.x,LECTERN.y-30,40); emote(player.x,player.y,"🕯️"); me.e={k:"🕯️",t:Date.now()}; dirty();
+  toast("기도제목이 촛불로 올려졌어요 🕯️");
+}
+async function prayFor(id){
+  const pr=ls("br_prayed")||{}; if(pr[id]){ toast("이미 함께 기도했어요 🙏"); return; }
+  const p=prayers.get(id); if(!p) return;
+  const nv=(+p.amen||0)+1;
+  if(shared&&db){ const ref=db.collection(prayPath()).doc(id);
+    try{ await ref.update({amen:nv}); }catch(e){ try{ await ref.set({...p,amen:nv}); }catch(e2){ toast("저장하지 못했어요"); return; } } }
+  p.amen=nv; if(!shared) savePrayersLocal();
+  pr[id]=1; ls("br_prayed",pr);
+  emote(player.x,player.y,"🙏"); me.e={k:"🙏",t:Date.now()}; dirty();
+  renderWallList(); svcIdx=-1; tickService(true);
+}
+async function delPrayer(id){
+  if(shared&&db){ try{ await db.collection(prayPath()).doc(id).delete(); }catch(e){ toast("내리지 못했어요"); return; } }
+  prayers.delete(id); if(!shared) savePrayersLocal();
+  const mine=ls("br_myprayers")||{}; delete mine[id]; ls("br_myprayers",mine);
+  renderWallList(); svcIdx=-1; tickService(true);
+}
+document.addEventListener("click",e=>{ const b=e.target.closest&&e.target.closest("[data-act=wall]"); if(b&&!b.onclick) openPrayerWall(); });
+
+function goToAltar(){ moveTo(LECTERN.x+(player.x<LECTERN.x?-60:60),LECTERN.y+110,openPrayerWall); }
+
+// ---------- boot ----------
+(function(){
+  let h=""; try{ h=(location.hash||"").replace("#",""); }catch(e){}
+  const saved=ls("br_group");
+  if(/^g-[a-z0-9]{4,12}$/.test(h)){ const code=h.slice(2); group={code,name:(saved&&saved.code===code&&saved.name)||ls("br_gname_"+code)||("모임 "+code)}; }
+  else if(saved&&saved.code) group=saved;
+})();
+renderGroup(); loadLocal(); loadPrayersLocal(); renderSpaceUI(); renderTop(); tickService(true);
+$("spName").onclick=openSpaces;
+$("svX").onclick=()=>{ const c=$("svc"); c.classList.toggle("min"); $("svX").textContent=c.classList.contains("min")?"펼치기":"접기"; };
+$("clPrac").onclick=()=>{ practice={sp:space,start:Date.now()}; svcIdx=-1; tickService(true); toast("연습 모드예요. 순서가 지금부터 진행돼요"); };
+$("clPray").onclick=()=>switchSpace("prayer");
+$("clMove").onclick=openSpaces;
+const splashStart=Date.now();
+function splashReady(){ const sp=$("splash"); if(!sp||sp.classList.contains("ready")) return; sp.classList.add("ready");
+  $("splashSub").innerHTML="화면을 눌러 들어가기<br><span style='font-size:12.5px;color:#6f6a62'>🎵 찬송이 함께 흘러나와요</span>";
+  sp.onclick=()=>{ sp.classList.add("out"); if(ls("br_audio")!==false) setAudio(true); setTimeout(()=>sp.remove(),1100); const h=$("hint"); h.style.opacity=1; setTimeout(()=>h.style.opacity=0,7000); }; }
+setTimeout(splashReady, 2600);
+if(!build3D()){ $("hint").textContent="3D 화면을 불러오지 못했어요. 새로고침해 주세요"; $("hint").style.opacity=1; }
+window.addEventListener("resize",resize); resize();
+$("bSound").onclick=()=>setAudio(!audioOn); if(audioOn){ $("bSound").textContent="🎵"; $("bSound").classList.add("on"); }
+requestAnimationFrame(frame);
+(function waitClaude(n){
+  if(window.claude&&typeof window.claude.use==="function"){ initDB(); initRoom(); return; }
+  if(n>30){ $("mode").style.display="block"; $("mode").textContent="미리보기 · 진행은 이 기기에만 저장돼요"; $("online").textContent="나 혼자"; $("dot").classList.add("off"); return; }
+  setTimeout(()=>waitClaude(n+1),100);
+})(0);
+
+</script>
+</body>
+</html>
